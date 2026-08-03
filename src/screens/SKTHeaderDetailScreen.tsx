@@ -16,6 +16,9 @@ import { SKTDetail, SetoranWorker } from '../types/skt';
 import { saveToCache, loadFromCache, sktDetailCacheKey } from '../storage/persistence';
 import { useOffline } from '../context/OfflineContext';
 import DetailMejaModal from '../components/DetailMejaModal';
+import TambahPekerjaModal from '../components/TambahPekerjaModal';
+import { groupWorkersByMeja } from '../utils/mejaGrouping';
+import { MasterPekerja } from '../types/pekerja';
 
 type DetailRouteProp = RouteProp<RootStackParamList, 'SKTHeaderDetail'>;
 type NavProp = NativeStackNavigationProp<RootStackParamList, 'SKTHeaderDetail'>;
@@ -47,6 +50,13 @@ export default function SKTHeaderDetailScreen() {
   const [error, setError] = useState<string | null>(null);
   const [selectedMeja, setSelectedMeja] = useState<'Semua Meja' | number>('Semua Meja');
   const [showDetailMeja, setShowDetailMeja] = useState(false);
+
+  // --- Tambah Pekerja dialog, nested on top of DetailMejaModal ---
+  const [showTambahPekerja, setShowTambahPekerja] = useState(false);
+  const [activeAddMeja, setActiveAddMeja] = useState<number | null>(null);
+
+  // --- Delete Pekerja, from within DetailMejaModal ---
+  const [deletingPekerjaId, setDeletingPekerjaId] = useState<number | null>(null);
 
   const loadDetail = useCallback(async () => {
     setIsLoading(true);
@@ -87,9 +97,125 @@ export default function SKTHeaderDetailScreen() {
     return workers.filter((w) => w.nomorMeja === selectedMeja);
   }, [workers, selectedMeja]);
 
+  // Real MejaGroup[] derived from `workers` — this is what DetailMejaModal
+  // actually needs (it was previously being passed brakId/jumlahMeja/workers,
+  // none of which match the component's props, hence the undefined crash).
+  const mejaGroups = useMemo(() => groupWorkersByMeja(workers), [workers]);
+
+  // The pekerja already sitting in the meja currently being added to —
+  // TambahPekerjaModal uses this to compute which role codes are still free.
+  const activeMejaPekerja = useMemo(
+    () => mejaGroups.find((g) => g.nomorMeja === activeAddMeja)?.pekerja ?? [],
+    [mejaGroups, activeAddMeja]
+  );
+
   const handleTambahSetoran = () => {
     // UI-only for now — the add-setoran flow/logic will be wired up later.
     Alert.alert('Tambah Setoran', 'This action will be implemented next.');
+  };
+
+  const handleAddPekerja = (nomorMeja: number) => {
+    setActiveAddMeja(nomorMeja);
+    setShowTambahPekerja(true);
+  };
+
+  const handleDeletePekerja = (nomorMeja: number, pekerjaId: number) => {
+    const worker = workers.find((w) => w.id === pekerjaId);
+    const label = worker ? worker.namaPekerja : 'pekerja ini';
+
+    Alert.alert('Hapus Pekerja', `Yakin ingin menghapus ${label} dari Meja ${nomorMeja}?`, [
+      { text: 'Batal', style: 'cancel' },
+      {
+        text: 'Hapus',
+        style: 'destructive',
+        onPress: async () => {
+          setDeletingPekerjaId(pekerjaId);
+
+          // --- LOCAL-ONLY for now — no network call. This still runs the
+          // full confirm -> loading-spinner -> removed flow so the UI/logic
+          // can be tested end-to-end before a real endpoint exists.
+          //
+          // Once the backend team confirms the real POST endpoint (see the
+          // submitDeletePekerja template in sktApi.ts), swap this whole
+          // block for:
+          //
+          //   try {
+          //     await submitDeletePekerja({ sktHeaderId: item.id, nomorMeja, pekerjaId });
+          //     setWorkers((prev) => prev.filter((w) => w.id !== pekerjaId));
+          //   } catch (err) {
+          //     Alert.alert('Gagal Menghapus', 'Terjadi kesalahan saat menghapus pekerja. Silakan coba lagi.');
+          //   } finally {
+          //     setDeletingPekerjaId(null);
+          //   }
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          console.log('[LOCAL TEST] would submit delete pekerja', {
+            sktHeaderId: item.id,
+            nomorMeja,
+            pekerjaId,
+          });
+          setWorkers((prev) => prev.filter((w) => w.id !== pekerjaId));
+          setDeletingPekerjaId(null);
+          // --- end LOCAL-ONLY block
+        },
+      },
+    ]);
+  };
+
+  const handleSubmitTambahPekerja = async (pekerja: MasterPekerja, kode: string) => {
+    const nomorMeja = activeAddMeja;
+    if (nomorMeja === null) return;
+
+    setShowTambahPekerja(false);
+
+    // --- LOCAL-ONLY for now — no network call. Adds a locally-generated
+    // row (negative placeholder id, so it can't collide with real
+    // skt_log_pekerja_id values) so the new pekerja shows up immediately
+    // for testing.
+    //
+    // Once the backend team confirms the real POST endpoint (see the
+    // submitAddPekerja template in sktApi.ts), swap this whole block for:
+    //
+    //   try {
+    //     const newWorker = await submitAddPekerja({
+    //       sktHeaderId: item.id,
+    //       nomorMeja,
+    //       kode,
+    //       masterPekerjaId: pekerja.id,
+    //       nik: pekerja.nik,
+    //       namaPekerja: pekerja.namaPekerja,
+    //       nomorAbsen: pekerja.nomorAbsen,
+    //     });
+    //     setWorkers((prev) => [...prev, newWorker]);
+    //   } catch (err) {
+    //     Alert.alert('Gagal Menambahkan', 'Terjadi kesalahan saat menambahkan pekerja. Silakan coba lagi.');
+    //   }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    const newWorker: SetoranWorker = {
+      id: -Date.now(),
+      kodeSetoran: kode,
+      namaPekerja: pekerja.namaPekerja,
+      nomorAbsen: pekerja.nomorAbsen,
+      nik: pekerja.nik,
+      nomorMeja,
+      totalSetoran: 0,
+      totalDefect: 0,
+      jamMasuk: new Date().toISOString(),
+      jamKeluar: '',
+    };
+
+    console.log('[LOCAL TEST] would submit add pekerja', {
+      sktHeaderId: item.id,
+      nomorMeja,
+      kode,
+      masterPekerjaId: pekerja.id,
+      nik: pekerja.nik,
+      namaPekerja: pekerja.namaPekerja,
+      nomorAbsen: pekerja.nomorAbsen,
+    });
+
+    setWorkers((prev) => [...prev, newWorker]);
+    // --- end LOCAL-ONLY block
   };
 
   if (isLoading && !detail) {
@@ -283,10 +409,23 @@ export default function SKTHeaderDetailScreen() {
       <DetailMejaModal
         visible={showDetailMeja}
         onClose={() => setShowDetailMeja(false)}
+        brakLabel={`Brak ${item.brakId}`}
+        tanggal={formattedDate}
+        mejaGroups={mejaGroups}
+        deletingPekerjaId={deletingPekerjaId}
+        onDeletePekerja={handleDeletePekerja}
+        onAddPekerja={handleAddPekerja}
+      />
+
+      {/* Tambah Pekerja dialog, stacked on top of Detail Meja */}
+      <TambahPekerjaModal
+        visible={showTambahPekerja}
+        onClose={() => setShowTambahPekerja(false)}
+        nomorMeja={activeAddMeja}
         brakId={item.brakId}
-        tanggal={item.tanggal}
-        jumlahMeja={item.jumlahMeja}
-        workers={workers}
+        existingPekerja={activeMejaPekerja}
+        onPressScan={() => navigation.navigate('AbsensiScan')}
+        onSubmit={handleSubmitTambahPekerja}
       />
     </View>
   );

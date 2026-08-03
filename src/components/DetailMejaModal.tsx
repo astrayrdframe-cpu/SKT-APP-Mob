@@ -26,7 +26,7 @@ export default function DetailMejaModal({
   onClose,
   brakLabel,
   tanggal,
-  mejaGroups,
+  mejaGroups = [],
   onDeletePekerja,
   onAddPekerja,
 }: DetailMejaModalProps) {
@@ -87,13 +87,15 @@ export default function DetailMejaModal({
                   </View>
                 ))}
 
-                <TouchableOpacity
-                  style={styles.addPekerjaButton}
-                  onPress={() => onAddPekerja(meja.nomorMeja)}
-                  activeOpacity={0.8}
-                >
-                  <Text style={styles.addPekerjaButtonText}>+ Add Pekerja</Text>
-                </TouchableOpacity>
+                {meja.pekerja.length < 5 && (
+                  <TouchableOpacity
+                    style={styles.addPekerjaButton}
+                    onPress={() => onAddPekerja(meja.nomorMeja)}
+                    activeOpacity={0.8}
+                  >
+                    <Text style={styles.addPekerjaButtonText}>+ Add Pekerja</Text>
+                  </TouchableOpacity>
+                )}
               </View>
             ))}
           </ScrollView>

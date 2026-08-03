@@ -13,8 +13,19 @@ export interface MejaGroup {
   pekerja: PekerjaRow[];
 }
 
-// The pekerja currently selected/scanned inside the Tambah Pekerja dialog.
-export interface SelectedPekerja {
-  namaPekerja: string;
+// A single row from skt_master_pekerja — the full worker directory used to
+// populate the "Pilih Pekerja" search combobox inside TambahPekerjaModal.
+// `nik` doubles as the (non-editable) "Kode Pekerja" value once a worker
+// is selected.
+export interface MasterPekerja {
+  id: number;
+  nomorAbsen: string;
   nik: string;
+  namaPekerja: string;
+  active: boolean;
+  isTraining: boolean;
+  brakId: number; // skt_master_brak_id — used to scope suggestions to the current Brak
 }
+
+// The pekerja currently selected inside the Tambah Pekerja dialog.
+export type SelectedPekerja = Pick<MasterPekerja, 'id' | 'namaPekerja' | 'nik'>;

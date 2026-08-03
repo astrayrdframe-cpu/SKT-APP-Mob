@@ -259,3 +259,99 @@ export async function fetchSetoranSummary(id: number): Promise<SetoranSummary> {
 
   return { headerId: id, totalSetoran, totalUpah, mejaSummaries };
 }
+
+/**
+ * TEMPLATE for the real "remove pekerja from meja" transaction — not
+ * called anywhere yet. DetailMejaModal's delete button currently only
+ * updates local state so the UI/loading-flow can be tested without a
+ * backend. Once the backend team confirms the real submission endpoint
+ * (a POST to a custom PL/SQL/ORDS module is more likely here than a plain
+ * AutoREST DELETE, since skt_log_pekerja's writable endpoint shape hasn't
+ * been confirmed):
+ *
+ *   1. Replace SKT_LOG_PEKERJA_DELETE_ENDPOINT below with the real URL.
+ *   2. Adjust DeletePekerjaPayload's fields to match what the endpoint
+ *      actually expects (field names, extra required fields, etc).
+ *   3. In SKTHeaderDetailScreen.tsx's handleDeletePekerja, replace the
+ *      "LOCAL-ONLY" block with a call to submitDeletePekerja (see the
+ *      commented example already sitting right above it there).
+ */
+// TODO: replace with the real POST endpoint once confirmed with the backend team.
+const SKT_LOG_PEKERJA_DELETE_ENDPOINT =
+  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/TODO_REPLACE_ME';
+
+export interface DeletePekerjaPayload {
+  sktHeaderId: number;
+  nomorMeja: number;
+  pekerjaId: number; // skt_log_pekerja_id
+}
+
+export async function submitDeletePekerja(payload: DeletePekerjaPayload): Promise<void> {
+  const response = await fetch(SKT_LOG_PEKERJA_DELETE_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to delete pekerja id=${payload.pekerjaId} (status ${response.status})`);
+  }
+}
+
+/**
+ * TEMPLATE for the real "add pekerja to meja" transaction — not called
+ * anywhere yet. TambahPekerjaModal's Tambah button currently only adds a
+ * locally-generated row (negative placeholder id) so the UI/logic can be
+ * tested without a backend. Once the real endpoint is confirmed:
+ *
+ *   1. Replace SKT_LOG_PEKERJA_ADD_ENDPOINT below with the real URL.
+ *   2. Adjust AddPekerjaPayload / the response mapping below to match
+ *      whatever the endpoint actually accepts and returns.
+ *   3. In SKTHeaderDetailScreen.tsx's handleSubmitTambahPekerja, replace
+ *      the "LOCAL-ONLY" block with a call to submitAddPekerja (see the
+ *      commented example already sitting right above it there).
+ */
+// TODO: replace with the real POST endpoint once confirmed with the backend team.
+const SKT_LOG_PEKERJA_ADD_ENDPOINT =
+  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/TODO_REPLACE_ME_ADD';
+
+export interface AddPekerjaPayload {
+  sktHeaderId: number;
+  nomorMeja: number;
+  kode: string; // "1" | "2" | "3" | "4" | "A" | "B" | "C" | "D"
+  masterPekerjaId: number; // skt_master_pekerja.id
+  nik: string;
+  namaPekerja: string;
+  nomorAbsen: string;
+}
+
+export async function submitAddPekerja(payload: AddPekerjaPayload): Promise<SetoranWorker> {
+  const response = await fetch(SKT_LOG_PEKERJA_ADD_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to add pekerja (status ${response.status})`);
+  }
+
+  const data = await response.json();
+
+  // ASSUMPTION — unconfirmed: the endpoint is assumed to echo back the
+  // created row (or at least a new skt_log_pekerja_id) so the UI can
+  // reconcile the locally-generated placeholder with the real one. Adjust
+  // this mapping once the actual response shape is known.
+  return {
+    id: data.id ?? data.skt_log_pekerja_id,
+    kodeSetoran: payload.kode,
+    namaPekerja: payload.namaPekerja,
+    nomorAbsen: payload.nomorAbsen,
+    nik: payload.nik,
+    nomorMeja: payload.nomorMeja,
+    totalSetoran: 0,
+    totalDefect: 0,
+    jamMasuk: data.jam_masuk ?? new Date().toISOString(),
+    jamKeluar: data.jam_keluar ?? '',
+  };
+}
