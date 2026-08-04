@@ -42,12 +42,42 @@ export default function AbsensiScanScreen() {
   const route = useRoute<AbsensiScanRouteProp>();
   const isFocused = useIsFocused();
   const onScanned = route.params?.onScanned;
+  const onCancelled = route.params?.onCancelled;
 
   const { hasPermission, requestPermission } = useCameraPermission();
 
   const [scanState, setScanState] = useState<ScanState>(hasPermission ? 'idle' : 'no-permission');
   const [scannedNik, setScannedNik] = useState<string | null>(null);
   const [matchedPekerja, setMatchedPekerja] = useState<MasterPekerja | null>(null);
+
+  // On some devices, CameraX/MLKit can transiently report zero available
+  // devices for a brief moment right after permission is granted — the OS
+  // hasn't finished registering the camera as usable yet, even though the
+  // hardware is fine. A short delay before actually mounting <CodeScanner>
+  // avoids racing that window.
+  const [isCameraReady, setIsCameraReady] = useState(false);
+
+  // Bumped on every "Coba Lagi" tap to force CodeScannerErrorBoundary to
+  // fully remount (its own `hasError` state never resets on its own, so
+  // without this, retrying after one failure would do nothing forever).
+  const [retryKey, setRetryKey] = useState(0);
+
+  // Set right before a successful "Gunakan" — lets the beforeRemove
+  // listener below tell the difference between "left because of a
+  // completed scan" (already handled via onScanned) and "left some other
+  // way" (X button, hardware back, swipe-back gesture — none of which were
+  // reopening TambahPekerjaModal before, silently dropping the admin back
+  // onto the bare Detail Meja screen instead of resuming where they left off).
+  const resolvedRef = useRef(false);
+
+  React.useEffect(() => {
+    const unsubscribe = navigation.addListener('beforeRemove', () => {
+      if (!resolvedRef.current) {
+        onCancelled?.();
+      }
+    });
+    return unsubscribe;
+  }, [navigation, onCancelled]);
 
   // onBarcodeScanned fires on every detected frame (up to ~30/sec) while a
   // code stays in view, not once per physical scan — this guard plus
@@ -57,10 +87,16 @@ export default function AbsensiScanScreen() {
 
   React.useEffect(() => {
     if (!hasPermission) {
+      setIsCameraReady(false);
       requestPermission().then((granted) => {
         setScanState(granted ? 'idle' : 'no-permission');
       });
+      return;
     }
+
+    setIsCameraReady(false);
+    const timer = setTimeout(() => setIsCameraReady(true), 500);
+    return () => clearTimeout(timer);
   }, [hasPermission, requestPermission]);
 
   const handleScannedNik = useCallback(async (nik: string) => {
@@ -100,6 +136,7 @@ export default function AbsensiScanScreen() {
 
   const handleGunakan = () => {
     if (matchedPekerja) {
+      resolvedRef.current = true;
       onScanned?.(matchedPekerja);
     }
     navigation.goBack();
@@ -122,11 +159,15 @@ export default function AbsensiScanScreen() {
       </View>
 
       {/* Camera + built-in MLKit code scanner — only mounted once permission
-          is confirmed, since device enumeration can legitimately return
-          nothing before that, which is what was causing the crash here. */}
+          is confirmed AND a short settle delay has passed, since device
+          enumeration can transiently return nothing right after permission
+          is granted on some devices, which is what was causing the crash
+          here. key={retryKey} forces a full remount (and a fresh error
+          boundary) every time "Coba Lagi" is tapped. */}
       <View style={styles.cameraArea}>
-        {hasPermission ? (
+        {isCameraReady ? (
           <CodeScannerErrorBoundary
+            key={retryKey}
             onDeviceUnavailable={() => setScanState('no-device')}
           >
             <CodeScanner
@@ -173,13 +214,17 @@ export default function AbsensiScanScreen() {
           <View>
             <Text style={styles.errorTitle}>Kamera Tidak Ditemukan</Text>
             <Text style={styles.errorSubtitle}>
-              Tidak ada kamera yang terdeteksi di perangkat ini. Jika ini adalah emulator,
-              pastikan kamera diaktifkan di pengaturan AVD. Di perangkat fisik, coba tutup dan
-              buka ulang aplikasi.
+              Tidak ada kamera yang terdeteksi. Coba tutup paksa dan buka ulang aplikasi
+              (permission kamera yang baru saja diberikan kadang butuh restart aplikasi
+              penuh, bukan reload). Jika ini emulator, pastikan kamera diaktifkan di
+              pengaturan AVD.
             </Text>
             <TouchableOpacity
               style={styles.primaryButton}
-              onPress={() => setScanState('idle')}
+              onPress={() => {
+                setRetryKey((k) => k + 1);
+                setScanState('idle');
+              }}
               activeOpacity={0.85}
             >
               <Text style={styles.primaryButtonText}>Coba Lagi</Text>
@@ -206,22 +251,13 @@ export default function AbsensiScanScreen() {
             <Text style={styles.workerMeta}>
               NIK {matchedPekerja.nik} · {matchedPekerja.nomorAbsen}
             </Text>
-            <View style={styles.buttonRow}>
-              <TouchableOpacity
-                style={styles.secondaryButton}
-                onPress={resetToIdle}
-                activeOpacity={0.85}
-              >
-                <Text style={styles.secondaryButtonText}>Scan Lagi</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.primaryButton}
-                onPress={handleGunakan}
-                activeOpacity={0.85}
-              >
-                <Text style={styles.primaryButtonText}>Gunakan</Text>
-              </TouchableOpacity>
-            </View>
+            <TouchableOpacity
+              style={[styles.primaryButton, styles.fullWidthButton]}
+              onPress={handleGunakan}
+              activeOpacity={0.85}
+            >
+              <Text style={styles.primaryButtonText}>Gunakan</Text>
+            </TouchableOpacity>
           </View>
         )}
 
@@ -357,13 +393,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
   },
   buttonRow: { flexDirection: 'row', gap: 10, justifyContent: 'center' },
-  secondaryButton: {
-    backgroundColor: '#F2F4F7',
-    borderRadius: 24,
-    paddingVertical: 12,
-    paddingHorizontal: 20,
-  },
-  secondaryButtonText: { color: '#475467', fontWeight: '700', fontSize: 13 },
   primaryButton: {
     backgroundColor: '#2F5FD1',
     borderRadius: 24,
@@ -371,5 +400,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 24,
     alignSelf: 'center',
   },
-  primaryButtonText: { color: '#FFFFFF', fontWeight: '700', fontSize: 13 },
+  fullWidthButton: { alignSelf: 'stretch', marginTop: 4 },
+  primaryButtonText: { color: '#FFFFFF', fontWeight: '700', fontSize: 13, textAlign: 'center' },
 });

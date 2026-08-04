@@ -11,7 +11,7 @@ import {
 import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { RootStackParamList } from '../navigation/AppNavigation';
-import { fetchSktDetail } from '../api/sktApi';
+import { fetchSktDetail, addPekerjaToMeja, deletePekerjaFromMeja } from '../api/sktApi';
 import { SKTDetail, SetoranWorker } from '../types/skt';
 import { saveToCache, loadFromCache, sktDetailCacheKey } from '../storage/persistence';
 import { useOffline } from '../context/OfflineContext';
@@ -131,32 +131,17 @@ export default function SKTHeaderDetailScreen() {
         style: 'destructive',
         onPress: async () => {
           setDeletingPekerjaId(pekerjaId);
-
-          // --- LOCAL-ONLY for now — no network call. This still runs the
-          // full confirm -> loading-spinner -> removed flow so the UI/logic
-          // can be tested end-to-end before a real endpoint exists.
-          //
-          // Once the backend team confirms the real POST endpoint (see the
-          // submitDeletePekerja template in sktApi.ts), swap this whole
-          // block for:
-          //
-          //   try {
-          //     await submitDeletePekerja({ sktHeaderId: item.id, nomorMeja, pekerjaId });
-          //     setWorkers((prev) => prev.filter((w) => w.id !== pekerjaId));
-          //   } catch (err) {
-          //     Alert.alert('Gagal Menghapus', 'Terjadi kesalahan saat menghapus pekerja. Silakan coba lagi.');
-          //   } finally {
-          //     setDeletingPekerjaId(null);
-          //   }
-          await new Promise((resolve) => setTimeout(resolve, 500));
-          console.log('[LOCAL TEST] would submit delete pekerja', {
-            sktHeaderId: item.id,
-            nomorMeja,
-            pekerjaId,
-          });
-          setWorkers((prev) => prev.filter((w) => w.id !== pekerjaId));
-          setDeletingPekerjaId(null);
-          // --- end LOCAL-ONLY block
+          try {
+            await deletePekerjaFromMeja({ sktHeaderId: item.id, nomorMeja, pekerjaId });
+            setWorkers((prev) => prev.filter((w) => w.id !== pekerjaId));
+          } catch (err) {
+            Alert.alert(
+              'Gagal Menghapus',
+              'Terjadi kesalahan saat menghapus pekerja. Silakan coba lagi.'
+            );
+          } finally {
+            setDeletingPekerjaId(null);
+          }
         },
       },
     ]);
@@ -168,55 +153,23 @@ export default function SKTHeaderDetailScreen() {
 
     setShowTambahPekerja(false);
 
-    // --- LOCAL-ONLY for now — no network call. Adds a locally-generated
-    // row (negative placeholder id, so it can't collide with real
-    // skt_log_pekerja_id values) so the new pekerja shows up immediately
-    // for testing.
-    //
-    // Once the backend team confirms the real POST endpoint (see the
-    // submitAddPekerja template in sktApi.ts), swap this whole block for:
-    //
-    //   try {
-    //     const newWorker = await submitAddPekerja({
-    //       sktHeaderId: item.id,
-    //       nomorMeja,
-    //       kode,
-    //       masterPekerjaId: pekerja.id,
-    //       nik: pekerja.nik,
-    //       namaPekerja: pekerja.namaPekerja,
-    //       nomorAbsen: pekerja.nomorAbsen,
-    //     });
-    //     setWorkers((prev) => [...prev, newWorker]);
-    //   } catch (err) {
-    //     Alert.alert('Gagal Menambahkan', 'Terjadi kesalahan saat menambahkan pekerja. Silakan coba lagi.');
-    //   }
-    await new Promise((resolve) => setTimeout(resolve, 400));
-
-    const newWorker: SetoranWorker = {
-      id: -Date.now(),
-      kodeSetoran: kode,
-      namaPekerja: pekerja.namaPekerja,
-      nomorAbsen: pekerja.nomorAbsen,
-      nik: pekerja.nik,
-      nomorMeja,
-      totalSetoran: 0,
-      totalDefect: 0,
-      jamMasuk: new Date().toISOString(),
-      jamKeluar: '',
-    };
-
-    console.log('[LOCAL TEST] would submit add pekerja', {
-      sktHeaderId: item.id,
-      nomorMeja,
-      kode,
-      masterPekerjaId: pekerja.id,
-      nik: pekerja.nik,
-      namaPekerja: pekerja.namaPekerja,
-      nomorAbsen: pekerja.nomorAbsen,
-    });
-
-    setWorkers((prev) => [...prev, newWorker]);
-    // --- end LOCAL-ONLY block
+    try {
+      const newWorker = await addPekerjaToMeja({
+        sktHeaderId: item.id,
+        nomorMeja,
+        kode,
+        masterPekerjaId: pekerja.id,
+        nik: pekerja.nik,
+        namaPekerja: pekerja.namaPekerja,
+        nomorAbsen: pekerja.nomorAbsen,
+      });
+      setWorkers((prev) => [...prev, newWorker]);
+    } catch (err) {
+      Alert.alert(
+        'Gagal Menambahkan',
+        'Terjadi kesalahan saat menambahkan pekerja. Silakan coba lagi.'
+      );
+    }
   };
 
   if (isLoading && !detail) {
@@ -406,7 +359,14 @@ export default function SKTHeaderDetailScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* Detail Meja bottom sheet */}
+      {/* Detail Meja bottom sheet. TambahPekerjaModal is nested inside as
+          a child (not rendered separately below) — two independent
+          native <Modal> windows don't reliably stack in a predictable
+          z-order on Android, which was causing Tambah Pekerja to render
+          behind Detail Meja after returning from the QR scanner. Nesting
+          it here means there's only ever one real native Modal; Tambah
+          Pekerja is just a plain overlay View inside it, so it's always
+          correctly on top. */}
       <DetailMejaModal
         visible={showDetailMeja}
         onClose={() => setShowDetailMeja(false)}
@@ -416,29 +376,37 @@ export default function SKTHeaderDetailScreen() {
         deletingPekerjaId={deletingPekerjaId}
         onDeletePekerja={handleDeletePekerja}
         onAddPekerja={handleAddPekerja}
-      />
+      >
+        {showTambahPekerja && (
+          <TambahPekerjaModal
+            visible={showTambahPekerja}
+            onClose={() => setShowTambahPekerja(false)}
+            nomorMeja={activeAddMeja}
+            brakId={item.brakId}
+            existingPekerja={activeMejaPekerja}
+            scannedPekerja={scannedPekerja}
+            onPressScan={() => {
+              // Hide (unmount) the dialog while the full-screen scanner is
+              // up, then remount it once the scanner closes — either with
+              // a scanned worker pre-filled (onScanned) or unchanged
+              // (onCancelled), so the admin always lands back on Tambah
+              // Pekerja rather than the bare Detail Meja screen underneath.
+              setShowTambahPekerja(false);
+              navigation.navigate('AbsensiScan', {
+                onScanned: (pekerja) => {
+                  setScannedPekerja(pekerja);
+                  setShowTambahPekerja(true);
+                },
+                onCancelled: () => {
+                  setShowTambahPekerja(true);
+                },
+              });
+            }}
+            onSubmit={handleSubmitTambahPekerja}
+          />
+        )}
+      </DetailMejaModal>
 
-      {/* Tambah Pekerja dialog, stacked on top of Detail Meja */}
-      <TambahPekerjaModal
-        visible={showTambahPekerja}
-        onClose={() => setShowTambahPekerja(false)}
-        nomorMeja={activeAddMeja}
-        brakId={item.brakId}
-        existingPekerja={activeMejaPekerja}
-        scannedPekerja={scannedPekerja}
-        onPressScan={() => {
-          // Hide the dialog while the full-screen scanner is up, then
-          // reopen it pre-filled once a worker is confirmed.
-          setShowTambahPekerja(false);
-          navigation.navigate('AbsensiScan', {
-            onScanned: (pekerja) => {
-              setScannedPekerja(pekerja);
-              setShowTambahPekerja(true);
-            },
-          });
-        }}
-        onSubmit={handleSubmitTambahPekerja}
-      />
     </View>
   );
 }

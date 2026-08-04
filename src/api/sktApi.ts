@@ -260,25 +260,23 @@ export async function fetchSetoranSummary(id: number): Promise<SetoranSummary> {
   return { headerId: id, totalSetoran, totalUpah, mejaSummaries };
 }
 
-/**
- * TEMPLATE for the real "remove pekerja from meja" transaction — not
- * called anywhere yet. DetailMejaModal's delete button currently only
- * updates local state so the UI/loading-flow can be tested without a
- * backend. Once the backend team confirms the real submission endpoint
- * (a POST to a custom PL/SQL/ORDS module is more likely here than a plain
- * AutoREST DELETE, since skt_log_pekerja's writable endpoint shape hasn't
- * been confirmed):
- *
- *   1. Replace SKT_LOG_PEKERJA_DELETE_ENDPOINT below with the real URL.
- *   2. Adjust DeletePekerjaPayload's fields to match what the endpoint
- *      actually expects (field names, extra required fields, etc).
- *   3. In SKTHeaderDetailScreen.tsx's handleDeletePekerja, replace the
- *      "LOCAL-ONLY" block with a call to submitDeletePekerja (see the
- *      commented example already sitting right above it there).
- */
+// ---------------------------------------------------------------------------
+// Pekerja add/delete — local-cache-for-testing, ORDS-ready for real use
+// ---------------------------------------------------------------------------
+//
+// Flip this one flag once the real ORDS endpoints below are filled in and
+// confirmed working. Every screen calls the addPekerjaToMeja /
+// deletePekerjaFromMeja wrappers further down — neither the UI nor
+// SKTHeaderDetailScreen needs to change when you flip it.
+export const USE_LOCAL_PEKERJA_CACHE = true;
+
 // TODO: replace with the real POST endpoint once confirmed with the backend team.
 const SKT_LOG_PEKERJA_DELETE_ENDPOINT =
-  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/TODO_REPLACE_ME';
+  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/TODO_REPLACE_ME_DELETE';
+
+// TODO: replace with the real POST endpoint once confirmed with the backend team.
+const SKT_LOG_PEKERJA_ADD_ENDPOINT =
+  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/TODO_REPLACE_ME_ADD';
 
 export interface DeletePekerjaPayload {
   sktHeaderId: number;
@@ -286,11 +284,31 @@ export interface DeletePekerjaPayload {
   pekerjaId: number; // skt_log_pekerja_id
 }
 
-export async function submitDeletePekerja(payload: DeletePekerjaPayload): Promise<void> {
+export interface AddPekerjaPayload {
+  sktHeaderId: number;
+  nomorMeja: number;
+  kode: string; // "1" | "2" | "3" | "4" | "A" | "B" | "C" | "D"
+  masterPekerjaId: number; // skt_master_pekerja.id
+  nik: string; // the field the ORDS module keys the lookup/insert on
+  namaPekerja: string;
+  nomorAbsen: string;
+}
+
+/**
+ * TEMPLATE — real POST to remove a pekerja from a meja. Body uses
+ * snake_case matching typical ORDS/DB column naming, not the camelCase
+ * used on the TS side. NIK is sent explicitly since it's the natural key
+ * an ORDS PL/SQL module would use to identify the worker.
+ */
+async function submitDeletePekerja(payload: DeletePekerjaPayload): Promise<void> {
   const response = await fetch(SKT_LOG_PEKERJA_DELETE_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      skt_header_id: payload.sktHeaderId,
+      nomor_meja: payload.nomorMeja,
+      skt_log_pekerja_id: payload.pekerjaId,
+    }),
   });
 
   if (!response.ok) {
@@ -298,38 +316,44 @@ export async function submitDeletePekerja(payload: DeletePekerjaPayload): Promis
   }
 }
 
-/**
- * TEMPLATE for the real "add pekerja to meja" transaction — not called
- * anywhere yet. TambahPekerjaModal's Tambah button currently only adds a
- * locally-generated row (negative placeholder id) so the UI/logic can be
- * tested without a backend. Once the real endpoint is confirmed:
- *
- *   1. Replace SKT_LOG_PEKERJA_ADD_ENDPOINT below with the real URL.
- *   2. Adjust AddPekerjaPayload / the response mapping below to match
- *      whatever the endpoint actually accepts and returns.
- *   3. In SKTHeaderDetailScreen.tsx's handleSubmitTambahPekerja, replace
- *      the "LOCAL-ONLY" block with a call to submitAddPekerja (see the
- *      commented example already sitting right above it there).
- */
-// TODO: replace with the real POST endpoint once confirmed with the backend team.
-const SKT_LOG_PEKERJA_ADD_ENDPOINT =
-  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/TODO_REPLACE_ME_ADD';
-
-export interface AddPekerjaPayload {
-  sktHeaderId: number;
-  nomorMeja: number;
-  kode: string; // "1" | "2" | "3" | "4" | "A" | "B" | "C" | "D"
-  masterPekerjaId: number; // skt_master_pekerja.id
-  nik: string;
-  namaPekerja: string;
-  nomorAbsen: string;
+/** Local-only removal — no network call, just resolves immediately. */
+async function deletePekerjaLocalCache(_payload: DeletePekerjaPayload): Promise<void> {
+  return;
 }
 
-export async function submitAddPekerja(payload: AddPekerjaPayload): Promise<SetoranWorker> {
+/**
+ * Entry point DetailMejaModal's delete flow should call. Routes to the
+ * local cache or the real ORDS POST based on USE_LOCAL_PEKERJA_CACHE — the
+ * caller never needs to know which one actually ran.
+ */
+export async function deletePekerjaFromMeja(payload: DeletePekerjaPayload): Promise<void> {
+  if (USE_LOCAL_PEKERJA_CACHE) {
+    return deletePekerjaLocalCache(payload);
+  }
+  return submitDeletePekerja(payload);
+}
+
+/**
+ * TEMPLATE — real POST to add a pekerja to a meja. Body is deliberately
+ * snake_case (nik, nomor_meja, kode, ...) to match a typical ORDS
+ * AutoREST/PL/SQL module's expected column names — adjust field names
+ * here once the real module's contract is known. NIK is the field most
+ * ORDS "add worker" modules would key off; masterPekerjaId is included
+ * too in case the endpoint prefers an ID-based lookup instead.
+ */
+async function submitAddPekerja(payload: AddPekerjaPayload): Promise<SetoranWorker> {
   const response = await fetch(SKT_LOG_PEKERJA_ADD_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      skt_header_id: payload.sktHeaderId,
+      nomor_meja: payload.nomorMeja,
+      kode: payload.kode,
+      master_pekerja_id: payload.masterPekerjaId,
+      nik: payload.nik,
+      nama_pekerja: payload.namaPekerja,
+      nomor_absen: payload.nomorAbsen,
+    }),
   });
 
   if (!response.ok) {
@@ -354,4 +378,41 @@ export async function submitAddPekerja(payload: AddPekerjaPayload): Promise<Seto
     jamMasuk: data.jam_masuk ?? new Date().toISOString(),
     jamKeluar: data.jam_keluar ?? '',
   };
+}
+
+/**
+ * Local-only add — generates a placeholder row with a negative id (so it
+ * can never collide with a real skt_log_pekerja_id) and a short simulated
+ * delay, so the full confirm → loading → appears-in-list flow can still be
+ * tested without a backend.
+ */
+async function addPekerjaLocalCache(payload: AddPekerjaPayload): Promise<SetoranWorker> {
+  await new Promise((resolve) => setTimeout(resolve, 400));
+
+  return {
+    id: -Date.now(),
+    kodeSetoran: payload.kode,
+    namaPekerja: payload.namaPekerja,
+    nomorAbsen: payload.nomorAbsen,
+    nik: payload.nik,
+    nomorMeja: payload.nomorMeja,
+    totalSetoran: 0,
+    totalDefect: 0,
+    jamMasuk: new Date().toISOString(),
+    jamKeluar: '',
+  };
+}
+
+/**
+ * Entry point TambahPekerjaModal's Tambah button should call. Routes to
+ * the local cache or the real ORDS POST based on USE_LOCAL_PEKERJA_CACHE.
+ * To go live: fill in SKT_LOG_PEKERJA_ADD_ENDPOINT above, confirm the
+ * request/response shape with the backend team, then flip
+ * USE_LOCAL_PEKERJA_CACHE to false — nothing else needs to change.
+ */
+export async function addPekerjaToMeja(payload: AddPekerjaPayload): Promise<SetoranWorker> {
+  if (USE_LOCAL_PEKERJA_CACHE) {
+    return addPekerjaLocalCache(payload);
+  }
+  return submitAddPekerja(payload);
 }

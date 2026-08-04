@@ -1,5 +1,13 @@
 import React from 'react';
-import { Modal, View, Text, TouchableOpacity, ScrollView, StyleSheet } from 'react-native';
+import {
+  Modal,
+  View,
+  Text,
+  TouchableOpacity,
+  ScrollView,
+  ActivityIndicator,
+  StyleSheet,
+} from 'react-native';
 import { MejaGroup } from '../types/pekerja';
 
 interface DetailMejaModalProps {
@@ -8,8 +16,15 @@ interface DetailMejaModalProps {
   brakLabel: string; // e.g. "Brak 2"
   tanggal: string; // e.g. "13 Juli 2026"
   mejaGroups: MejaGroup[];
+  deletingPekerjaId?: number | null; // shows a spinner on this row's Delete button while its request is in flight
   onDeletePekerja: (nomorMeja: number, pekerjaId: number) => void;
   onAddPekerja: (nomorMeja: number) => void;
+  // Rendered inside this same native Modal window (e.g. TambahPekerjaModal),
+  // instead of as a separate <Modal> — two independent native Modal windows
+  // don't reliably stack in a predictable z-order on Android, which was
+  // causing Tambah Pekerja to render behind Detail Meja after returning
+  // from the QR scanner.
+  children?: React.ReactNode;
 }
 
 function KodeBadge({ kode }: { kode: string }) {
@@ -27,13 +42,15 @@ export default function DetailMejaModal({
   brakLabel,
   tanggal,
   mejaGroups = [],
+  deletingPekerjaId = null,
   onDeletePekerja,
   onAddPekerja,
+  children,
 }: DetailMejaModalProps) {
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
       <View style={styles.backdrop}>
-        <View style={styles.sheet}>
+      <View style={styles.sheet}>
           <View style={styles.dragHandle} />
 
           <View style={styles.headerRow}>
@@ -80,8 +97,13 @@ export default function DetailMejaModal({
                         style={styles.deleteButton}
                         onPress={() => onDeletePekerja(meja.nomorMeja, p.id)}
                         activeOpacity={0.75}
+                        disabled={p.id === deletingPekerjaId}
                       >
-                        <Text style={styles.deleteButtonText}>🗑 Delete</Text>
+                        {p.id === deletingPekerjaId ? (
+                          <ActivityIndicator size="small" color="#D92D20" />
+                        ) : (
+                          <Text style={styles.deleteButtonText}>🗑 Delete</Text>
+                        )}
                       </TouchableOpacity>
                     </View>
                   </View>
@@ -101,6 +123,7 @@ export default function DetailMejaModal({
           </ScrollView>
         </View>
       </View>
+      {children}
     </Modal>
   );
 }

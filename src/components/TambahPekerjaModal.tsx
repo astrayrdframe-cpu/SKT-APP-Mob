@@ -1,12 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import {
-  Modal,
   View,
   Text,
   TextInput,
   TouchableOpacity,
   ScrollView,
   ActivityIndicator,
+  Alert,
+  BackHandler,
   StyleSheet,
 } from 'react-native';
 import { MasterPekerja, PekerjaRow } from '../types/pekerja';
@@ -16,10 +17,18 @@ import { fetchMasterPekerja } from '../api/pekerjaApi';
 // alpha = batil. A meja can only ever have 5 people at once (enforced by
 // hiding "+ Add Pekerja" in DetailMejaModal), so at most 5 of these 8 are
 // ever in use at the same time.
-const ALL_CODES = ['1', '2', '3', 'A', 'B'];
+const ALL_CODES = ['1', '2', '3', '4', 'A', 'B', 'C', 'D'];
 
 function isNumericCode(code: string): boolean {
   return /^[0-9]+$/.test(code);
+}
+
+// True once a pekerja already holds one numeric (giling) code AND one
+// alpha (batil) code in this meja — at that point they're fully occupied
+// and can't take on a third role here.
+function hasBothRoles(nik: string, existingPekerja: PekerjaRow[]): boolean {
+  const codes = existingPekerja.filter((p) => p.nik === nik).map((p) => p.kode);
+  return codes.some(isNumericCode) && codes.some((c) => !isNumericCode(c));
 }
 
 function KodeBadge({ code }: { code: string }) {
@@ -94,12 +103,18 @@ export default function TambahPekerjaModal({
   // is recomputed exactly as if the admin had typed the name.
   useEffect(() => {
     if (!scannedPekerja) return;
+
+    if (hasBothRoles(scannedPekerja.nik, existingPekerja)) {
+      Alert.alert('Tidak Bisa Ditambahkan', 'Sudah Terdaftar Sebagai Giling dan Batil');
+      return;
+    }
+
     setSelectedPekerja(scannedPekerja);
     setSearchQuery(scannedPekerja.namaPekerja);
     setIsDropdownOpen(false);
     setSelectedKode(null);
     setIsKodeDropdownOpen(false);
-  }, [scannedPekerja]);
+  }, [scannedPekerja, existingPekerja]);
 
   const filteredPekerja =
     searchQuery.trim().length === 0
@@ -146,6 +161,11 @@ export default function TambahPekerjaModal({
   };
 
   const handleSelectPekerja = (pekerja: MasterPekerja) => {
+    if (hasBothRoles(pekerja.nik, existingPekerja)) {
+      Alert.alert('Tidak Bisa Ditambahkan', 'Sudah Terdaftar Sebagai Giling dan Batil');
+      return;
+    }
+
     setSelectedPekerja(pekerja);
     setSearchQuery(pekerja.namaPekerja);
     setIsDropdownOpen(false);
@@ -169,31 +189,45 @@ export default function TambahPekerjaModal({
     resetState();
   };
 
+  // No longer a separate <Modal> — it renders as a child inside
+  // DetailMejaModal's single native window instead (two independent
+  // native Modals don't reliably stack in a predictable z-order on
+  // Android). BackHandler replaces what onRequestClose used to give us.
+  useEffect(() => {
+    if (!visible) return;
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      handleClose();
+      return true;
+    });
+    return () => sub.remove();
+  }, [visible]);
+
+  if (!visible) return null;
+
   return (
-    <Modal visible={visible} transparent animationType="fade" onRequestClose={handleClose}>
-      <View style={styles.backdrop}>
-        <View style={styles.card}>
-          <View style={styles.headerRow}>
-            <Text style={styles.title}>Tambah Pekerja</Text>
-            <TouchableOpacity onPress={handleClose} accessibilityLabel="Close">
-              <Text style={styles.closeIcon}>✕</Text>
-            </TouchableOpacity>
-          </View>
+    <View style={styles.backdrop}>
+      <View style={styles.card}>
+        <View style={styles.headerRow}>
+          <Text style={styles.title}>Tambah Pekerja</Text>
+          <TouchableOpacity onPress={handleClose} accessibilityLabel="Close">
+            <Text style={styles.closeIcon}>✕</Text>
+          </TouchableOpacity>
+        </View>
 
-          <Text style={styles.mejaLabel}>Meja {nomorMeja ?? '-'}</Text>
+        <Text style={styles.mejaLabel}>Meja {nomorMeja ?? '-'}</Text>
 
-          <Text style={styles.fieldLabel}>Pilih Pekerja</Text>
-          <View style={styles.pilihPekerjaBox}>
-            <TextInput
-              style={styles.searchInput}
-              value={searchQuery}
-              onChangeText={handleSearchChange}
-              onFocus={() => setIsDropdownOpen(true)}
-              placeholder="Cari nama pekerja..."
-              placeholderTextColor="#98A2B3"
-            />
-            <TouchableOpacity style={styles.scanButton} onPress={onPressScan} activeOpacity={0.8}>
-              <Text style={styles.scanButtonText}>⌕ Scan</Text>
+        <Text style={styles.fieldLabel}>Pilih Pekerja</Text>
+        <View style={styles.pilihPekerjaBox}>
+          <TextInput
+            style={styles.searchInput}
+            value={searchQuery}
+            onChangeText={handleSearchChange}
+            onFocus={() => setIsDropdownOpen(true)}
+            placeholder="Cari nama pekerja..."
+            placeholderTextColor="#98A2B3"
+          />
+          <TouchableOpacity style={styles.scanButton} onPress={onPressScan} activeOpacity={0.8}>
+            <Text style={styles.scanButtonText}>⌕ Scan</Text>
             </TouchableOpacity>
           </View>
 
@@ -293,13 +327,12 @@ export default function TambahPekerjaModal({
           </View>
         </View>
       </View>
-    </Modal>
   );
 }
 
 const styles = StyleSheet.create({
   backdrop: {
-    flex: 1,
+    ...StyleSheet.absoluteFillObject,
     backgroundColor: 'rgba(16, 24, 40, 0.55)',
     justifyContent: 'center',
     alignItems: 'center',

@@ -6,26 +6,42 @@
 // stack can read connectivity state via useOffline(). AbsensiScan is
 // registered as a modal presentation, reachable from the Scan button
 // inside TambahPekerjaModal.
+//
+// AbsensiScanScreen is imported lazily (React.lazy) rather than with a
+// normal top-level import. A plain `import AbsensiScanScreen from ...`
+// gets evaluated the instant this file loads — which means
+// react-native-vision-camera's native module gets touched as soon as the
+// navigator mounts, not only when the scanner is actually opened. If that
+// native dependency has any linking issue (wrong version installed,
+// missing pod/gradle setup, stale build, etc), a plain import can crash
+// the whole navigator — taking down every screen, including
+// SKTHeaderDetailScreen, which has nothing to do with the camera. Lazy
+// loading confines any camera-related crash to just the AbsensiScan route.
 
-import React from 'react';
+import React, { Suspense } from 'react';
+import { View } from 'react-native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import SKTHeaderDashboardScreen from '../screens/SKTHeaderDashboardScreen';
 import SKTHeaderDetailScreen from '../screens/SKTHeaderDetailScreen';
 import SetoranSummaryScreen from '../screens/SetoranSummaryScreen';
-import AbsensiScanScreen from '../screens/AbsensiScanScreen';
 import { OfflineProvider } from '../context/OfflineContext';
 import { SKTHeaderItem } from '../types/skt';
 import { MasterPekerja } from '../types/pekerja';
+
+const AbsensiScanScreen = React.lazy(() => import('../screens/AbsensiScanScreen'));
 
 export type RootStackParamList = {
   SKTHeaderDashboard: undefined;
   SKTHeaderDetail: { id: string | number; preview?: SKTHeaderItem };
   SetoranSummary: { id: number };
   // onScanned fires once a scanned NIK resolves to a real pekerja and the
-  // admin confirms "Gunakan" — lets whichever screen opened the scanner
-  // (e.g. TambahPekerjaModal via SKTHeaderDetailScreen) receive the result
-  // directly instead of re-navigating with serialized params.
-  AbsensiScan: { onScanned?: (pekerja: MasterPekerja) => void } | undefined;
+  // admin confirms "Gunakan". onCancelled fires if the scanner closes any
+  // other way (X button, hardware back, swipe-back) — both exist so
+  // TambahPekerjaModal reliably reopens no matter how the scan ends,
+  // instead of only on a successful scan.
+  AbsensiScan:
+    | { onScanned?: (pekerja: MasterPekerja) => void; onCancelled?: () => void }
+    | undefined;
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -39,11 +55,13 @@ const AppNavigation = () => {
         <Stack.Screen name="SKTHeaderDashboard" component={SKTHeaderDashboardScreen} />
         <Stack.Screen name="SKTHeaderDetail" component={SKTHeaderDetailScreen} />
         <Stack.Screen name="SetoranSummary" component={SetoranSummaryScreen} />
-        <Stack.Screen
-          name="AbsensiScan"
-          component={AbsensiScanScreen}
-          options={{ presentation: 'fullScreenModal' }}
-        />
+        <Stack.Screen name="AbsensiScan" options={{ presentation: 'fullScreenModal' }}>
+          {(props: any) => (
+            <Suspense fallback={<View style={{ flex: 1, backgroundColor: '#0B0F1A' }} />}>
+              <AbsensiScanScreen {...props} />
+            </Suspense>
+          )}
+        </Stack.Screen>
       </Stack.Navigator>
     </OfflineProvider>
   );
