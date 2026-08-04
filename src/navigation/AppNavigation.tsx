@@ -15,12 +15,17 @@ import SetoranSummaryScreen from '../screens/SetoranSummaryScreen';
 import AbsensiScanScreen from '../screens/AbsensiScanScreen';
 import { OfflineProvider } from '../context/OfflineContext';
 import { SKTHeaderItem } from '../types/skt';
+import { MasterPekerja } from '../types/pekerja';
 
 export type RootStackParamList = {
   SKTHeaderDashboard: undefined;
   SKTHeaderDetail: { id: string | number; preview?: SKTHeaderItem };
   SetoranSummary: { id: number };
-  AbsensiScan: undefined;
+  // onScanned fires once a scanned NIK resolves to a real pekerja and the
+  // admin confirms "Gunakan" — lets whichever screen opened the scanner
+  // (e.g. TambahPekerjaModal via SKTHeaderDetailScreen) receive the result
+  // directly instead of re-navigating with serialized params.
+  AbsensiScan: { onScanned?: (pekerja: MasterPekerja) => void } | undefined;
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();

@@ -54,6 +54,7 @@ export default function SKTHeaderDetailScreen() {
   // --- Tambah Pekerja dialog, nested on top of DetailMejaModal ---
   const [showTambahPekerja, setShowTambahPekerja] = useState(false);
   const [activeAddMeja, setActiveAddMeja] = useState<number | null>(null);
+  const [scannedPekerja, setScannedPekerja] = useState<MasterPekerja | null>(null);
 
   // --- Delete Pekerja, from within DetailMejaModal ---
   const [deletingPekerjaId, setDeletingPekerjaId] = useState<number | null>(null);
@@ -424,7 +425,18 @@ export default function SKTHeaderDetailScreen() {
         nomorMeja={activeAddMeja}
         brakId={item.brakId}
         existingPekerja={activeMejaPekerja}
-        onPressScan={() => navigation.navigate('AbsensiScan')}
+        scannedPekerja={scannedPekerja}
+        onPressScan={() => {
+          // Hide the dialog while the full-screen scanner is up, then
+          // reopen it pre-filled once a worker is confirmed.
+          setShowTambahPekerja(false);
+          navigation.navigate('AbsensiScan', {
+            onScanned: (pekerja) => {
+              setScannedPekerja(pekerja);
+              setShowTambahPekerja(true);
+            },
+          });
+        }}
         onSubmit={handleSubmitTambahPekerja}
       />
     </View>

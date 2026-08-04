@@ -78,3 +78,29 @@ export async function fetchMasterPekerja(
     )
     .sort((a, b) => a.namaPekerja.localeCompare(b.namaPekerja));
 }
+
+/**
+ * Looks up a single pekerja by NIK — used by the attendance QR scanner so
+ * an admin can scan a worker's ID card/QR instead of searching by name.
+ * Uses ORDS's `q` filter to fetch just the matching row rather than
+ * pulling the whole directory for a single lookup.
+ */
+export async function findMasterPekerjaByNik(nik: string): Promise<MasterPekerja | null> {
+  const filter = encodeURIComponent(JSON.stringify({ nik }));
+  const rows = (await fetchAllOrdsRows(
+    `${SKT_MASTER_PEKERJA_ENDPOINT}?q=${filter}`
+  )) as RawPekerjaRow[];
+
+  const match = rows.find((row) => row.active === 1 && row.is_training === 0);
+  if (!match) return null;
+
+  return {
+    id: match.id,
+    nomorAbsen: match.nomor_absen,
+    nik: match.nik,
+    namaPekerja: match.nama_pekerja,
+    active: match.active === 1,
+    isTraining: match.is_training === 1,
+    brakId: match.skt_master_brak_id,
+  };
+}

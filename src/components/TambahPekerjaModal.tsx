@@ -37,6 +37,7 @@ interface TambahPekerjaModalProps {
   nomorMeja: number | null;
   brakId?: number; // scopes the search results to this Brak, if provided
   existingPekerja: PekerjaRow[]; // rows already in this meja — determines which codes are still available
+  scannedPekerja?: MasterPekerja | null; // result handed back from AbsensiScanScreen after a QR scan
   onPressScan: () => void; // navigates to the attendance QR scanner
   onSubmit: (pekerja: MasterPekerja, kode: string) => void;
 }
@@ -47,6 +48,7 @@ export default function TambahPekerjaModal({
   nomorMeja,
   brakId,
   existingPekerja,
+  scannedPekerja,
   onPressScan,
   onSubmit,
 }: TambahPekerjaModalProps) {
@@ -85,6 +87,19 @@ export default function TambahPekerjaModal({
       isCancelled = true;
     };
   }, [visible, brakId]);
+
+  // Pre-fill the search box and selection whenever a fresh scan result
+  // arrives from AbsensiScanScreen — this is the "just scan the ID card"
+  // shortcut for the same search+select flow, so Kode Pekerja availability
+  // is recomputed exactly as if the admin had typed the name.
+  useEffect(() => {
+    if (!scannedPekerja) return;
+    setSelectedPekerja(scannedPekerja);
+    setSearchQuery(scannedPekerja.namaPekerja);
+    setIsDropdownOpen(false);
+    setSelectedKode(null);
+    setIsKodeDropdownOpen(false);
+  }, [scannedPekerja]);
 
   const filteredPekerja =
     searchQuery.trim().length === 0

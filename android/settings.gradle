@@ -3,4 +3,12 @@ plugins { id("com.facebook.react.settings") }
 extensions.configure(com.facebook.react.ReactSettingsExtension){ ex -> ex.autolinkLibrariesFromCommand() }
 rootProject.name = 'mobileScannerSkt'
 include ':app'
+
+// Manual include — autolinking wasn't picking these up on their own.
+include ':react-native-nitro-modules'
+project(':react-native-nitro-modules').projectDir = new File(rootDir, '../node_modules/react-native-nitro-modules/android')
+
+include ':react-native-nitro-image'
+project(':react-native-nitro-image').projectDir = new File(rootDir, '../node_modules/react-native-nitro-image/android')
+
 includeBuild('../node_modules/@react-native/gradle-plugin')

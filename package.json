@@ -20,9 +20,12 @@
     "react": "19.2.3",
     "react-native": "0.86.0",
     "react-native-gesture-handler": "^3.1.0",
+    "react-native-nitro-modules": "^0.36.5",
     "react-native-safe-area-context": "^5.8.0",
     "react-native-screens": "^4.26.2",
     "react-native-toast-message": "^2.3.3",
+    "react-native-vision-camera": "^5.2.1",
+    "react-native-vision-camera-barcode-scanner": "^5.2.1",
     "react-navigation": "^5.0.0",
     "zustand": "^5.0.14"
   },

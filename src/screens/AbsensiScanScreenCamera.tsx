@@ -7,9 +7,35 @@ import type { RootStackParamList } from '../navigation/AppNavigation';
 import { findMasterPekerjaByNik } from '../api/pekerjaApi';
 import { MasterPekerja } from '../types/pekerja';
 
-type ScanState = 'no-permission' | 'idle' | 'verifying' | 'success' | 'not-found';
+type ScanState = 'no-permission' | 'no-device' | 'idle' | 'verifying' | 'success' | 'not-found';
 
 type AbsensiScanRouteProp = RouteProp<RootStackParamList, 'AbsensiScan'>;
+
+// CodeScanner throws synchronously in its render if no camera device is
+// found (e.g. an emulator without a camera configured, or a brief timing
+// gap before the OS finishes enumerating devices). A plain try/catch can't
+// catch a render-time throw from a child component — only a class-based
+// error boundary can — so this turns that crash into a normal state update
+// instead of a red error screen.
+class CodeScannerErrorBoundary extends React.Component<
+  { children: React.ReactNode; onDeviceUnavailable: () => void },
+  { hasError: boolean }
+> {
+  state = { hasError: false };
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch() {
+    this.props.onDeviceUnavailable();
+  }
+
+  render() {
+    if (this.state.hasError) return null;
+    return this.props.children;
+  }
+}
 
 export default function AbsensiScanScreen() {
   const navigation = useNavigation();
@@ -95,15 +121,23 @@ export default function AbsensiScanScreen() {
         <View style={{ width: 20 }} />
       </View>
 
-      {/* Camera + built-in MLKit code scanner */}
+      {/* Camera + built-in MLKit code scanner — only mounted once permission
+          is confirmed, since device enumeration can legitimately return
+          nothing before that, which is what was causing the crash here. */}
       <View style={styles.cameraArea}>
-        <CodeScanner
-          style={StyleSheet.absoluteFill}
-          isActive={isCameraActive}
-          barcodeFormats={['qr-code']}
-          onBarcodeScanned={handleBarcodeScanned}
-          onError={() => setScanState('not-found')}
-        />
+        {hasPermission ? (
+          <CodeScannerErrorBoundary
+            onDeviceUnavailable={() => setScanState('no-device')}
+          >
+            <CodeScanner
+              style={StyleSheet.absoluteFill}
+              isActive={isCameraActive}
+              barcodeFormats={['qr-code']}
+              onBarcodeScanned={handleBarcodeScanned}
+              onError={() => setScanState('not-found')}
+            />
+          </CodeScannerErrorBoundary>
+        ) : null}
 
         <View pointerEvents="none" style={styles.scanFrame}>
           <View style={[styles.corner, styles.cornerTL]} />
@@ -131,6 +165,24 @@ export default function AbsensiScanScreen() {
               activeOpacity={0.85}
             >
               <Text style={styles.primaryButtonText}>Buka Pengaturan</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {scanState === 'no-device' && (
+          <View>
+            <Text style={styles.errorTitle}>Kamera Tidak Ditemukan</Text>
+            <Text style={styles.errorSubtitle}>
+              Tidak ada kamera yang terdeteksi di perangkat ini. Jika ini adalah emulator,
+              pastikan kamera diaktifkan di pengaturan AVD. Di perangkat fisik, coba tutup dan
+              buka ulang aplikasi.
+            </Text>
+            <TouchableOpacity
+              style={styles.primaryButton}
+              onPress={() => setScanState('idle')}
+              activeOpacity={0.85}
+            >
+              <Text style={styles.primaryButtonText}>Coba Lagi</Text>
             </TouchableOpacity>
           </View>
         )}
