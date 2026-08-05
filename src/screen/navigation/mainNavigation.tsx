@@ -76,10 +76,6 @@ const MainNavigator = () => {
           name="AbsensiScan"
           options={{
             presentation: 'fullScreenModal',
-            // Native-stack's modal transition flashes the OS default white
-            // window background on Android before the screen's own content
-            // paints — this matches the scanner's actual background so
-            // that flash isn't visible.
             contentStyle: { backgroundColor: '#0B0F1A' },
           }}>
           {(props: any) => (

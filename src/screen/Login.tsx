@@ -96,7 +96,7 @@ export default function LoginScreen() {
                 },
             });
 
-            Alert.alert('Login Successful', 'You have been logged in successfully!');
+            
         } catch (error: any) {
             Alert.alert('Login Failed', error.message || 'An error occurred during login');
             console.error('Login error:', error);
