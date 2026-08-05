@@ -9,8 +9,9 @@ import {
   BackHandler,
   StyleSheet,
 } from 'react-native';
-import { MasterPekerja, PekerjaRow } from '../../../services/pekerja';
+import { MasterPekerja, MejaGroup, PekerjaRow } from '../../../services/pekerja';
 import { fetchMasterPekerja } from '../../../services/API/pekerjaApi';
+import { isNumericCode } from '../../../utils/pekerjaRole';
 
 // Every possible role code a meja slot can hold — numeric = giling,
 // alpha = batil. A meja can only ever have 5 people at once (enforced by
@@ -18,16 +19,26 @@ import { fetchMasterPekerja } from '../../../services/API/pekerjaApi';
 // ever in use at the same time.
 const ALL_CODES = ['1', '2', '3', 'A', 'B'];
 
-function isNumericCode(code: string): boolean {
-  return /^[0-9]+$/.test(code);
-}
-
 // True once a pekerja already holds one numeric (giling) code AND one
 // alpha (batil) code in this meja — at that point they're fully occupied
 // and can't take on a third role here.
 function hasBothRoles(nik: string, existingPekerja: PekerjaRow[]): boolean {
   const codes = existingPekerja.filter((p) => p.nik === nik).map((p) => p.kode);
   return codes.some(isNumericCode) && codes.some((c) => !isNumericCode(c));
+}
+
+// A pekerja can only ever sit at one meja per SKT header — if their NIK is
+// already registered on some OTHER meja, they can't be added here too.
+// Returns that meja's nomor, or null if `nik` isn't seated anywhere else.
+function findOtherMeja(
+  nik: string,
+  mejaGroups: MejaGroup[],
+  currentMeja: number | null
+): number | null {
+  const other = mejaGroups.find(
+    (g) => g.nomorMeja !== currentMeja && g.pekerja.some((p) => p.nik === nik)
+  );
+  return other ? other.nomorMeja : null;
 }
 
 function KodeBadge({ code }: { code: string }) {
@@ -45,6 +56,7 @@ interface TambahPekerjaModalProps {
   nomorMeja: number | null;
   brakId?: number; // scopes the search results to this Brak, if provided
   existingPekerja: PekerjaRow[]; // rows already in this meja — determines which codes are still available
+  mejaGroups: MejaGroup[]; // every meja in this SKT header — used to block adding a pekerja who's already seated at a different meja
   scannedPekerja?: MasterPekerja | null; // result handed back from AbsensiScanScreen after a QR scan
   onPressScan: () => void; // navigates to the attendance QR scanner
   onSubmit: (pekerja: MasterPekerja, kode: string) => void;
@@ -56,6 +68,7 @@ export default function TambahPekerjaModal({
   nomorMeja,
   brakId,
   existingPekerja,
+  mejaGroups,
   scannedPekerja,
   onPressScan,
   onSubmit,
@@ -122,6 +135,12 @@ export default function TambahPekerjaModal({
   useEffect(() => {
     if (!scannedPekerja) return;
 
+    const otherMeja = findOtherMeja(scannedPekerja.nik, mejaGroups, nomorMeja);
+    if (otherMeja !== null) {
+      setErrorMessage(`Sudah Terdaftar di Meja ${otherMeja}`);
+      return;
+    }
+
     if (hasBothRoles(scannedPekerja.nik, existingPekerja)) {
       setErrorMessage('Sudah Terdaftar Sebagai Giling dan Batil');
       return;
@@ -132,7 +151,7 @@ export default function TambahPekerjaModal({
     setIsDropdownOpen(false);
     setSelectedKode(null);
     setIsKodeDropdownOpen(false);
-  }, [scannedPekerja, existingPekerja]);
+  }, [scannedPekerja, existingPekerja, mejaGroups, nomorMeja]);
 
   const filteredPekerja =
     searchQuery.trim().length === 0
@@ -144,8 +163,10 @@ export default function TambahPekerjaModal({
   // Codes already sitting in this meja (by anyone) are off the table.
   // On top of that, the selected pekerja specifically can't take a second
   // numeric code if they already hold one, nor a second alpha code if they
-  // already hold one — same name is fine across meja as long as it's one
-  // numeric + one alpha, never number+number or letter+letter.
+  // already hold one — one numeric + one alpha within THIS meja is fine,
+  // never number+number or letter+letter. (Being seated at a different
+  // meja entirely is handled earlier, by findOtherMeja — that's an outright
+  // block, not a code-availability question.)
   const usedCodesInMeja = new Set(existingPekerja.map((p) => p.kode));
   const selectedPekerjaCodesInMeja = selectedPekerja
     ? existingPekerja.filter((p) => p.nik === selectedPekerja.nik).map((p) => p.kode)
@@ -179,6 +200,12 @@ export default function TambahPekerjaModal({
   };
 
   const handleSelectPekerja = (pekerja: MasterPekerja) => {
+    const otherMeja = findOtherMeja(pekerja.nik, mejaGroups, nomorMeja);
+    if (otherMeja !== null) {
+      setErrorMessage(`Sudah Terdaftar di Meja ${otherMeja}`);
+      return;
+    }
+
     if (hasBothRoles(pekerja.nik, existingPekerja)) {
       setErrorMessage('Sudah Terdaftar Sebagai Giling dan Batil');
       return;

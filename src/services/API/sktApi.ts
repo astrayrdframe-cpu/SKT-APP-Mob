@@ -74,6 +74,46 @@ function deriveJenisLabel(jenisGarapanId: string, jumlahGarapanLembur: number): 
   return 'Biasa';
 }
 
+// ---------------------------------------------------------------------------
+// TEMPORARY TEST DATA — dual-role (Giling + Batil) demo row
+// ---------------------------------------------------------------------------
+// The backend hasn't produced a real skt_view row where one pekerja holds
+// BOTH a Giling (numeric) and a Batil (alpha) kode at the same meja, so
+// there's no way to manually verify Tambah Setoran's dual-role scan
+// validation against real data yet. This clones an existing Giling worker
+// into a second row at the same meja under a free Batil kode — same NIK,
+// so scanning that same real pekerja's badge for BOTH Pekerja Giling and
+// Pekerja Batil in Tambah Setoran should succeed once this is in place.
+//
+// Purely a client-side splice of the already-fetched `workers` list — no
+// POST, nothing persisted server-side. Flip INJECT_DUAL_ROLE_TEST_ROW to
+// false (or delete this block and its call site below) once real
+// dual-role data exists upstream or this has served its testing purpose.
+const INJECT_DUAL_ROLE_TEST_ROW = true;
+
+function injectDualRoleTestRow(workers: SetoranWorker[]): SetoranWorker[] {
+  if (!INJECT_DUAL_ROLE_TEST_ROW) return workers;
+
+  const gilingSample = workers.find((w) => isGilingCode(w.kodeSetoran));
+  if (!gilingSample) return workers; // no Giling worker to clone from
+
+  const sameMeja = workers.filter((w) => w.nomorMeja === gilingSample.nomorMeja);
+  const usedCodes = new Set(sameMeja.map((w) => w.kodeSetoran));
+  const freeBatilCode = ['A', 'B'].find((c) => !usedCodes.has(c));
+  if (!freeBatilCode) return workers; // meja's Batil seats are already full
+
+  const testRow: SetoranWorker = {
+    ...gilingSample,
+    id: -1, // negative id — never collides with a real skt_log_pekerja_id
+    kodeSetoran: freeBatilCode,
+    namaPekerja: `${gilingSample.namaPekerja} (TEST DUAL-ROLE)`,
+  };
+
+  return [...workers, testRow].sort(
+    (a, b) => a.nomorMeja - b.nomorMeja || a.kodeSetoran.localeCompare(b.kodeSetoran)
+  );
+}
+
 /**
  * Dashboard list. skt_header has everything except jumlah_meja, which
  * only exists on skt_view (repeated per worker row) — so we still need
@@ -140,21 +180,23 @@ export async function fetchSktDetail(
     totalSetoranUnit: 'btg', // ASSUMPTION — no unit field in the schema
   };
 
-  const workers: SetoranWorker[] = relatedRows
-    .map((row): SetoranWorker => ({
-      id: row.skt_log_pekerja_id,
-      kodeSetoran: row.kode_setoran,
-      namaPekerja: row.nama_pekerja,
-      nomorAbsen: row.nomor_absen,
-      nik: row.nik,
-      nomorMeja: row.nomor_meja,
-      totalSetoran: row.total_setoran ?? 0,
-      totalDefect: row.total_defect ?? 0,
-      jamMasuk: row.jam_masuk,
-      jamKeluar: row.jam_keluar,
-    }))
-    // Group by meja first, then by kode_setoran ("1","2","3","A","B") within it
-    .sort((a, b) => a.nomorMeja - b.nomorMeja || a.kodeSetoran.localeCompare(b.kodeSetoran));
+  const workers: SetoranWorker[] = injectDualRoleTestRow(
+    relatedRows
+      .map((row): SetoranWorker => ({
+        id: row.skt_log_pekerja_id,
+        kodeSetoran: row.kode_setoran,
+        namaPekerja: row.nama_pekerja,
+        nomorAbsen: row.nomor_absen,
+        nik: row.nik,
+        nomorMeja: row.nomor_meja,
+        totalSetoran: row.total_setoran ?? 0,
+        totalDefect: row.total_defect ?? 0,
+        jamMasuk: row.jam_masuk,
+        jamKeluar: row.jam_keluar,
+      }))
+      // Group by meja first, then by kode_setoran ("1","2","3","A","B") within it
+      .sort((a, b) => a.nomorMeja - b.nomorMeja || a.kodeSetoran.localeCompare(b.kodeSetoran))
+  );
 
   return { detail, workers };
 }

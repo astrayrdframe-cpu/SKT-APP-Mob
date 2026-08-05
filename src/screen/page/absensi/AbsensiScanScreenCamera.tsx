@@ -1,7 +1,7 @@
 import React, { useCallback, useRef, useState } from 'react';
 import { View, Text, TouchableOpacity, ActivityIndicator, StyleSheet, Linking } from 'react-native';
 import { useNavigation, useRoute, useIsFocused, RouteProp } from '@react-navigation/native';
-import { useCameraPermission } from 'react-native-vision-camera';
+import { useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
 import { CodeScanner, Barcode } from 'react-native-vision-camera-barcode-scanner';
 import type { RootStackParamList } from '../../navigation/mainNavigation';
 import { findMasterPekerjaByNik } from '../../../services/API/pekerjaApi';
@@ -49,20 +49,28 @@ export default function AbsensiScanScreen() {
 
   const { hasPermission, requestPermission } = useCameraPermission();
 
+  // Reactive, not polled — react-native-vision-camera resolves its device
+  // factory asynchronously (native enumeration) and this hook re-renders on
+  // its own the moment that finishes, whether that takes 100ms or 3s. That
+  // replaces an earlier fixed `setTimeout` "settle delay" before mounting
+  // <CodeScanner>, which guessed 500ms was always enough — on a cold start
+  // (first scanner open in the session, right after the permission prompt,
+  // while CameraX/the HAL is still initializing) enumeration can genuinely
+  // take longer than that, so <CodeScanner> mounted too early, threw "No
+  // Camera device available!", and always showed "Kamera Tidak Ditemukan"
+  // on the very first open even with permission already granted. Later
+  // opens in the same session were fine because the factory promise was
+  // already resolved and cached by then.
+  const device = useCameraDevice('back');
+
   const [scanState, setScanState] = useState<ScanState>(hasPermission ? 'idle' : 'no-permission');
   const [scannedNik, setScannedNik] = useState<string | null>(null);
   const [matchedPekerja, setMatchedPekerja] = useState<MasterPekerja | null>(null);
 
-  // On some devices, CameraX/MLKit can transiently report zero available
-  // devices for a brief moment right after permission is granted — the OS
-  // hasn't finished registering the camera as usable yet, even though the
-  // hardware is fine. A short delay before actually mounting <CodeScanner>
-  // avoids racing that window.
-  const [isCameraReady, setIsCameraReady] = useState(false);
-
   // Bumped on every "Coba Lagi" tap to force CodeScannerErrorBoundary to
   // fully remount (its own `hasError` state never resets on its own, so
-  // without this, retrying after one failure would do nothing forever).
+  // without this, retrying after one failure would do nothing forever) and
+  // to restart the no-device grace timer below.
   const [retryKey, setRetryKey] = useState(0);
 
   // Set right before a successful "Gunakan" — lets the beforeRemove
@@ -89,18 +97,24 @@ export default function AbsensiScanScreen() {
   const isProcessingRef = useRef(false);
 
   React.useEffect(() => {
-    if (!hasPermission) {
-      setIsCameraReady(false);
-      requestPermission().then((granted) => {
-        setScanState(granted ? 'idle' : 'no-permission');
-      });
-      return;
-    }
-
-    setIsCameraReady(false);
-    const timer = setTimeout(() => setIsCameraReady(true), 500);
-    return () => clearTimeout(timer);
+    if (hasPermission) return;
+    requestPermission().then((granted) => {
+      setScanState(granted ? 'idle' : 'no-permission');
+    });
   }, [hasPermission, requestPermission]);
+
+  // Genuine "no camera" fallback (e.g. an AVD emulator with no camera
+  // configured) — if `device` is still unresolved after a generous grace
+  // period, stop waiting and show the real error state instead of leaving
+  // the admin staring at a spinner forever. Restarts on every "Coba Lagi"
+  // via retryKey.
+  React.useEffect(() => {
+    if (!hasPermission || device != null) return;
+    const timer = setTimeout(() => {
+      setScanState((current) => (current === 'idle' ? 'no-device' : current));
+    }, 6000);
+    return () => clearTimeout(timer);
+  }, [hasPermission, device, retryKey]);
 
   const handleScannedNik = useCallback(async (nik: string) => {
     setScannedNik(nik);
@@ -182,13 +196,14 @@ export default function AbsensiScanScreen() {
       </View>
 
       {/* Camera + built-in MLKit code scanner — only mounted once permission
-          is confirmed AND a short settle delay has passed, since device
-          enumeration can transiently return nothing right after permission
-          is granted on some devices, which is what was causing the crash
-          here. key={retryKey} forces a full remount (and a fresh error
-          boundary) every time "Coba Lagi" is tapped. */}
+          is confirmed AND `useCameraDevice` has actually resolved a device,
+          rather than after a guessed fixed delay (see the `device` comment
+          above for why that used to fail on the first open). key={retryKey}
+          forces a full remount (and a fresh error boundary) every time
+          "Coba Lagi" is tapped. The error boundary stays as a safety net
+          for any other synchronous throw from CodeScanner. */}
       <View style={styles.cameraArea}>
-        {isCameraReady ? (
+        {hasPermission && device != null ? (
           <CodeScannerErrorBoundary
             key={retryKey}
             onDeviceUnavailable={() => setScanState('no-device')}
@@ -201,6 +216,8 @@ export default function AbsensiScanScreen() {
               onError={() => setScanState('not-found')}
             />
           </CodeScannerErrorBoundary>
+        ) : hasPermission && scanState === 'idle' ? (
+          <ActivityIndicator color="#2F5FD1" />
         ) : null}
 
         <View pointerEvents="none" style={styles.scanFrame}>
@@ -210,7 +227,7 @@ export default function AbsensiScanScreen() {
           <View style={[styles.corner, styles.cornerBR]} />
         </View>
 
-        {isCameraActive && (
+        {isCameraActive && device != null && (
           <Text style={styles.cameraHint}>
             {isBarcodeMode ? 'Arahkan kamera ke barcode tray' : 'Arahkan kamera ke barcode pekerja'}
           </Text>
@@ -257,7 +274,11 @@ export default function AbsensiScanScreen() {
           </View>
         )}
 
-        {scanState === 'idle' && (
+        {scanState === 'idle' && device == null && (
+          <Text style={styles.idleText}>Menyiapkan kamera...</Text>
+        )}
+
+        {scanState === 'idle' && device != null && (
           <Text style={styles.idleText}>
             {isBarcodeMode ? 'Menunggu barcode tray...' : 'Menunggu barcode...'}
           </Text>

@@ -96,6 +96,7 @@ export default function DetailMejaDemoScreen() {
             onClose={() => setTambahVisible(false)}
             nomorMeja={activeMeja}
             existingPekerja={activeMejaPekerja}
+            mejaGroups={mejaGroups}
             scannedPekerja={scannedPekerja}
             onPressScan={() => console.log('open scanner / picker')}
             onSubmit={handleSubmitTambah}

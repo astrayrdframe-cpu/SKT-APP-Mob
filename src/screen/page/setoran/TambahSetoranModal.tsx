@@ -12,7 +12,7 @@
 // — this component doesn't call navigation.navigate itself, the parent does
 // (via onPressScanGiling/Batil/Tray) and hands the result back through the
 // scannedGiling/scannedBatil/scannedTrayCode props.
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Modal,
   View,
@@ -24,9 +24,10 @@ import {
   BackHandler,
   StyleSheet,
 } from 'react-native';
-import { MasterPekerja } from '../../../services/pekerja';
+import { MasterPekerja, MejaGroup } from '../../../services/pekerja';
 import { BarcodeTrayRow } from '../../../services/skt';
 import { resolveBarcodeTray, SubmitSetoranPayload } from '../../../services/API/sktApi';
+import { isNumericCode } from '../../../utils/pekerjaRole';
 
 interface TambahSetoranModalProps {
   visible: boolean;
@@ -36,6 +37,20 @@ interface TambahSetoranModalProps {
   jenisLabel: string;
   brakLabel: string; // e.g. "Djinggo"
   nomorMeja: number;
+  // When the parent screen's own meja tab is "Semua Meja" there's no single
+  // meja this setoran unambiguously belongs to, so the caller passes every
+  // valid meja number here and the "Meja" field renders as a picker instead
+  // of the plain read-only box. Omitted (or a single-item list) keeps the
+  // old read-only behaviour — e.g. when a specific "Meja N" tab is active.
+  mejaOptions?: number[];
+  onChangeMeja?: (nomorMeja: number) => void;
+  // Every meja's roster (who's seated where, and as which kode) — a scan
+  // is only accepted for Pekerja Giling/Batil if the scanned NIK is
+  // actually seated at `nomorMeja`, and only in the matching role (numeric
+  // kode = Giling, alpha kode = Batil). Scanning is otherwise wide open to
+  // the whole master pekerja directory, which would let anyone from any
+  // meja (or the wrong role at this meja) get logged against this setoran.
+  mejaGroups: MejaGroup[];
   setoranKe: number;
   isSubmitting?: boolean;
   onSubmit: (payload: SubmitSetoranPayload) => void;
@@ -60,6 +75,9 @@ export default function TambahSetoranModal({
   jenisLabel,
   brakLabel,
   nomorMeja,
+  mejaOptions,
+  onChangeMeja,
+  mejaGroups,
   setoranKe,
   isSubmitting = false,
   onSubmit,
@@ -77,21 +95,71 @@ export default function TambahSetoranModal({
   const [barcodeTrays, setBarcodeTrays] = useState<BarcodeTrayRow[]>([]);
   const [badWaste, setBadWaste] = useState(0);
   const [isResolvingTray, setIsResolvingTray] = useState(false);
+  const [isMejaDropdownOpen, setIsMejaDropdownOpen] = useState(false);
 
-  // Fresh form every time the dialog opens.
+  // Rendered in-tree instead of Alert.alert — same reasoning as
+  // TambahPekerjaModal's errorMessage overlay: this dialog is its own
+  // native <Modal>, and Alert.alert opens a separate native OS dialog
+  // window that isn't guaranteed to stack above it. An in-tree overlay
+  // stacks exactly like the rest of this component, so it always renders
+  // in front.
+  const [scanError, setScanError] = useState<{ title: string; message: string } | null>(null);
+
+  const isMejaSelectable = !!mejaOptions && mejaOptions.length > 1;
+
+  // The roster actually seated at the meja this setoran targets — recomputed
+  // whenever that changes (tab switch, or the "Meja" picker above).
+  const currentMejaPekerja = useMemo(
+    () => mejaGroups.find((g) => g.nomorMeja === nomorMeja)?.pekerja ?? [],
+    [mejaGroups, nomorMeja]
+  );
+
+  // NOTE: there's deliberately no "reset on `visible`" effect here anymore.
+  // This component never actually unmounts between scans — hiding it just
+  // toggles the native <Modal visible={...}> off while AbsensiScan is up,
+  // then flips it back on once a scan resolves — and Giling/Batil/Barcode
+  // Tray scans ALL hide-then-reshow this same dialog. A `visible`-keyed
+  // reset would fire after EVERY one of those scans, wiping out whatever
+  // was already filled in (e.g. Batil clearing the Giling you'd just
+  // scanned, or a new tray silently erasing the ones scanned before it).
+  // The real "this is a fresh dialog" signal is the parent remounting this
+  // component via a bumped `key` prop on "+ Tambah Setoran" — see
+  // SKTHeaderDetailScreen — which re-initializes every useState above for
+  // free, without touching state across a scan's hide/reshow round trip.
+
+  // A giling/batil pick is only valid for one specific meja (its kode is
+  // registered there, not anywhere else) — if the admin changes meja after
+  // already scanning someone, that pick no longer means anything and has
+  // to be re-scanned.
   useEffect(() => {
-    if (!visible) return;
     setGiling(null);
     setBatil(null);
-    setBarcodeTrays([]);
-    setBadWaste(0);
-  }, [visible]);
+  }, [nomorMeja]);
 
   // Pick up a freshly scanned giling pekerja handed back from AbsensiScan.
+  // Only accepted if they're actually seated at this meja AND hold the
+  // Giling (numeric) kode there — anyone else is rejected outright. Note
+  // there's deliberately no "already picked as Batil" guard here: a pekerja
+  // can hold BOTH a Giling and a Batil kode at the same meja (see
+  // TambahPekerjaModal's dual-role rule), so the same NIK legitimately
+  // filling both slots in one setoran is the correct outcome, not an error
+  // — the seat check below (via `.some()` across every row for this NIK,
+  // not just the first match) is what actually decides eligibility.
   useEffect(() => {
     if (!scannedGiling) return;
-    if (batil && batil.nik === scannedGiling.nik) {
-      Alert.alert('Tidak Bisa Digunakan', 'Pekerja ini sudah dipilih sebagai Pekerja Batil.');
+    const seatsForNik = currentMejaPekerja.filter((p) => p.nik === scannedGiling.nik);
+    if (seatsForNik.length === 0) {
+      setScanError({
+        title: 'Tidak Bisa Digunakan',
+        message: `${scannedGiling.namaPekerja} tidak terdaftar di Meja ${nomorMeja}.`,
+      });
+      return;
+    }
+    if (!seatsForNik.some((p) => isNumericCode(p.kode))) {
+      setScanError({
+        title: 'Tidak Bisa Digunakan',
+        message: `${scannedGiling.namaPekerja} terdaftar sebagai Batil di Meja ${nomorMeja}, bukan Giling.`,
+      });
       return;
     }
     setGiling(scannedGiling);
@@ -99,10 +167,29 @@ export default function TambahSetoranModal({
   }, [scannedGiling]);
 
   // Pick up a freshly scanned batil pekerja handed back from AbsensiScan.
+  // Only accepted if they're actually seated at this meja AND hold the
+  // Batil (alpha) kode there — anyone else is rejected outright. Same
+  // dual-role reasoning as the Giling effect above: no "already picked as
+  // Giling" guard, since the same NIK can legitimately fill both slots.
+  // groupWorkersByMeja sorts Giling (numeric) rows first, so a naive
+  // `.find()` here would always land on their Giling row and wrongly
+  // reject a dual-role pekerja's Batil scan — `.some()` across every row
+  // for this NIK is what makes the check correct.
   useEffect(() => {
     if (!scannedBatil) return;
-    if (giling && giling.nik === scannedBatil.nik) {
-      Alert.alert('Tidak Bisa Digunakan', 'Pekerja ini sudah dipilih sebagai Pekerja Giling.');
+    const seatsForNik = currentMejaPekerja.filter((p) => p.nik === scannedBatil.nik);
+    if (seatsForNik.length === 0) {
+      setScanError({
+        title: 'Tidak Bisa Digunakan',
+        message: `${scannedBatil.namaPekerja} tidak terdaftar di Meja ${nomorMeja}.`,
+      });
+      return;
+    }
+    if (!seatsForNik.some((p) => !isNumericCode(p.kode))) {
+      setScanError({
+        title: 'Tidak Bisa Digunakan',
+        message: `${scannedBatil.namaPekerja} terdaftar sebagai Giling di Meja ${nomorMeja}, bukan Batil.`,
+      });
       return;
     }
     setBatil(scannedBatil);
@@ -115,7 +202,10 @@ export default function TambahSetoranModal({
   useEffect(() => {
     if (!scannedTrayCode) return;
     if (barcodeTrays.some((t) => t.code === scannedTrayCode)) {
-      Alert.alert('Barcode Sudah Discan', `Tray ${scannedTrayCode} sudah ada di daftar.`);
+      setScanError({
+        title: 'Barcode Sudah Discan',
+        message: `Tray ${scannedTrayCode} sudah ada di daftar.`,
+      });
       return;
     }
 
@@ -127,7 +217,10 @@ export default function TambahSetoranModal({
       })
       .catch(() => {
         if (!isCancelled) {
-          Alert.alert('Gagal Membaca Barcode', `Barcode ${scannedTrayCode} tidak dikenali.`);
+          setScanError({
+            title: 'Gagal Membaca Barcode',
+            message: `Barcode ${scannedTrayCode} tidak dikenali.`,
+          });
         }
       })
       .finally(() => {
@@ -143,11 +236,15 @@ export default function TambahSetoranModal({
   useEffect(() => {
     if (!visible) return;
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
-      onClose();
+      if (scanError) {
+        setScanError(null);
+      } else {
+        onClose();
+      }
       return true;
     });
     return () => sub.remove();
-  }, [visible, onClose]);
+  }, [visible, onClose, scanError]);
 
   const handleDeleteTray = (code: string) => {
     setBarcodeTrays((prev) => prev.filter((t) => t.code !== code));
@@ -247,9 +344,46 @@ export default function TambahSetoranModal({
           <View style={[styles.twoCol, styles.fieldSpacing]}>
             <View style={styles.twoColItem}>
               <Text style={styles.fieldLabel}>Meja</Text>
-              <View style={styles.readonlyBox}>
-                <Text style={styles.readonlyValue}>{nomorMeja}</Text>
-              </View>
+              {isMejaSelectable ? (
+                <>
+                  <TouchableOpacity
+                    style={styles.mejaPickerBox}
+                    onPress={() => setIsMejaDropdownOpen((open) => !open)}
+                    activeOpacity={0.8}
+                  >
+                    <Text style={styles.readonlyValue}>{nomorMeja}</Text>
+                    <Text style={styles.mejaPickerChevron}>{isMejaDropdownOpen ? '⌃' : '⌄'}</Text>
+                  </TouchableOpacity>
+                  {isMejaDropdownOpen && (
+                    <View style={styles.mejaDropdown}>
+                      {mejaOptions!.map((meja) => (
+                        <TouchableOpacity
+                          key={meja}
+                          style={styles.mejaDropdownItem}
+                          onPress={() => {
+                            onChangeMeja?.(meja);
+                            setIsMejaDropdownOpen(false);
+                          }}
+                          activeOpacity={0.7}
+                        >
+                          <Text
+                            style={[
+                              styles.mejaDropdownItemText,
+                              meja === nomorMeja && styles.mejaDropdownItemTextActive,
+                            ]}
+                          >
+                            Meja {meja}
+                          </Text>
+                        </TouchableOpacity>
+                      ))}
+                    </View>
+                  )}
+                </>
+              ) : (
+                <View style={styles.readonlyBox}>
+                  <Text style={styles.readonlyValue}>{nomorMeja}</Text>
+                </View>
+              )}
             </View>
             <View style={styles.twoColItem}>
               <Text style={styles.fieldLabel}>Setoran ke</Text>
@@ -344,6 +478,25 @@ export default function TambahSetoranModal({
             )}
           </TouchableOpacity>
         </View>
+
+        {scanError && (
+          <View style={styles.errorOverlay}>
+            <View style={styles.errorBox}>
+              <View style={styles.errorIconCircle}>
+                <Text style={styles.errorIconText}>✕</Text>
+              </View>
+              <Text style={styles.errorTitle}>{scanError.title}</Text>
+              <Text style={styles.errorSubtitle}>{scanError.message}</Text>
+              <TouchableOpacity
+                style={styles.errorButton}
+                onPress={() => setScanError(null)}
+                activeOpacity={0.85}
+              >
+                <Text style={styles.errorButtonText}>Coba Lagi</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
       </View>
     </Modal>
   );
@@ -351,6 +504,57 @@ export default function TambahSetoranModal({
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: '#F7F8FA' },
+  // Matches the "Pekerja Tidak Ditemukan" card from AbsensiScanScreenCamera
+  // — icon circle + bold title + gray subtitle + full-width pill button —
+  // rendered as an in-tree overlay (see the `scanError` state comment
+  // above) rather than Alert.alert.
+  errorOverlay: {
+    ...StyleSheet.absoluteFill,
+    backgroundColor: 'rgba(16, 24, 40, 0.55)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 32,
+  },
+  errorBox: {
+    width: '100%',
+    maxWidth: 300,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 20,
+    padding: 24,
+    alignItems: 'center',
+  },
+  errorIconCircle: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: '#FEE4E2',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 14,
+  },
+  errorIconText: { fontSize: 24, color: '#D92D20', fontWeight: '700' },
+  errorTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#101828',
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  errorSubtitle: {
+    fontSize: 13,
+    color: '#667085',
+    textAlign: 'center',
+    lineHeight: 19,
+    marginBottom: 20,
+  },
+  errorButton: {
+    backgroundColor: '#2F5FD1',
+    borderRadius: 24,
+    paddingVertical: 13,
+    alignItems: 'center',
+    width: '100%',
+  },
+  errorButtonText: { fontSize: 14, fontWeight: '700', color: '#FFFFFF' },
   topBar: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -427,6 +631,35 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
   },
   readonlyValue: { fontSize: 15, fontWeight: '700', color: '#101828' },
+  mejaPickerBox: {
+    marginTop: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#D0D5DD',
+    borderRadius: 10,
+    paddingVertical: 11,
+    paddingHorizontal: 12,
+  },
+  mejaPickerChevron: { fontSize: 12, color: '#667085' },
+  mejaDropdown: {
+    marginTop: 4,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#D0D5DD',
+    borderRadius: 10,
+    overflow: 'hidden',
+  },
+  mejaDropdownItem: {
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F2F4F7',
+  },
+  mejaDropdownItemText: { fontSize: 13, fontWeight: '600', color: '#344054' },
+  mejaDropdownItemTextActive: { color: '#2F5FD1' },
 
   sectionHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   scanToAddButton: {

@@ -68,6 +68,15 @@ export default function SKTHeaderDetailScreen() {
 
   // --- Tambah Setoran dialog ---
   const [showTambahSetoran, setShowTambahSetoran] = useState(false);
+  // Bumped only in handleTambahSetoran (a genuine fresh open), never on the
+  // hide/reshow round trip a scan does — passed as TambahSetoranModal's
+  // `key` so React remounts it (fresh giling/batil/barcodeTrays/badWaste
+  // state) exactly when the admin taps "+ Tambah Setoran" again, and
+  // leaves its state alone while it's just being hidden behind the scanner.
+  const [tambahSetoranKey, setTambahSetoranKey] = useState(0);
+  // The admin's pick from the "Meja" dropdown, only meaningful (and only
+  // shown) while the header tab is on "Semua Meja" — see setoranTargetMeja.
+  const [setoranMejaOverride, setSetoranMejaOverride] = useState<number | null>(null);
   const [isSubmittingSetoran, setIsSubmittingSetoran] = useState(false);
   const [scannedSetoranGiling, setScannedSetoranGiling] = useState<MasterPekerja | null>(null);
   const [scannedSetoranBatil, setScannedSetoranBatil] = useState<MasterPekerja | null>(null);
@@ -107,6 +116,14 @@ export default function SKTHeaderDetailScreen() {
     )[];
   }, [detail?.jumlahMeja]);
 
+  // Just the numeric meja numbers, no 'Semua Meja' — this is what the
+  // "Meja" field inside Tambah Setoran picks from when the header tab is
+  // on 'Semua Meja' (see setoranTargetMeja/mejaOptions below).
+  const mejaNumberOptions = useMemo(
+    () => mejaTabs.filter((t): t is number => typeof t === 'number'),
+    [mejaTabs]
+  );
+
   const filteredWorkers = useMemo(() => {
     if (selectedMeja === 'Semua Meja') return workers;
     return workers.filter((w) => w.nomorMeja === selectedMeja);
@@ -124,11 +141,13 @@ export default function SKTHeaderDetailScreen() {
     [mejaGroups, activeAddMeja]
   );
 
-  // Which meja a fresh "+ Tambah Setoran" attaches to. ASSUMPTION: the
-  // currently selected meja tab; falls back to Meja 1 when "Semua Meja"
-  // is active (there's no meja-agnostic submission in this schema).
-  // Confirm this with the backend team once the real endpoint exists.
-  const setoranTargetMeja = selectedMeja === 'Semua Meja' ? 1 : selectedMeja;
+  // Which meja a fresh "+ Tambah Setoran" attaches to: the currently
+  // selected meja tab, or — since there's no meja-agnostic submission in
+  // this schema — the admin's own pick from the "Meja" dropdown inside the
+  // dialog when the header tab is on "Semua Meja" (defaulting to the first
+  // meja until they change it).
+  const setoranTargetMeja =
+    selectedMeja === 'Semua Meja' ? setoranMejaOverride ?? mejaNumberOptions[0] ?? 1 : selectedMeja;
 
   // ASSUMPTION: "Setoran ke" is the next sequence number for that meja —
   // i.e. one more than however many setoran rows already exist there.
@@ -142,6 +161,8 @@ export default function SKTHeaderDetailScreen() {
     setScannedSetoranGiling(null);
     setScannedSetoranBatil(null);
     setScannedTrayCode(null);
+    setSetoranMejaOverride(null);
+    setTambahSetoranKey((k) => k + 1);
     setShowTambahSetoran(true);
   };
 
@@ -461,6 +482,7 @@ export default function SKTHeaderDetailScreen() {
             nomorMeja={activeAddMeja}
             brakId={item.brakId}
             existingPekerja={activeMejaPekerja}
+            mejaGroups={mejaGroups}
             scannedPekerja={scannedPekerja}
             onPressScan={() => {
               // Hide (unmount) the dialog while the full-screen scanner is
@@ -489,6 +511,7 @@ export default function SKTHeaderDetailScreen() {
           opened directly from this screen's footer button rather than
           from within an already-open Detail Meja sheet. */}
       <TambahSetoranModal
+        key={tambahSetoranKey}
         visible={showTambahSetoran}
         onClose={() => setShowTambahSetoran(false)}
         sktHeaderId={item.id}
@@ -496,6 +519,9 @@ export default function SKTHeaderDetailScreen() {
         jenisLabel={item.jenisLabel}
         brakLabel={`Brak ${item.brakId}`}
         nomorMeja={setoranTargetMeja}
+        mejaOptions={selectedMeja === 'Semua Meja' ? mejaNumberOptions : undefined}
+        onChangeMeja={setSetoranMejaOverride}
+        mejaGroups={mejaGroups}
         setoranKe={setoranTargetKe}
         isSubmitting={isSubmittingSetoran}
         onSubmit={handleSubmitTambahSetoran}
