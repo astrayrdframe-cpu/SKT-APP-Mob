@@ -2,27 +2,37 @@ import React, { useState } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
 import DetailMejaModal from './page/components/DetailMejaModal';
 import TambahPekerjaModal from './page/components/TambahPekerjaModal';
-import { MasterPekerja, MejaGroup, PekerjaRow } from '../services/pekerja';
+import { buildDetailPekerja, MasterPekerja, MejaGroup, PekerjaRow } from '../services/pekerja';
 
 // Mock data mirroring the reference screenshots — swap for real skt_view
 // rows once the API wiring for this screen is ready.
+function mockPekerja(
+  id: number,
+  nomorAbsen: string,
+  namaPekerja: string,
+  nik: string,
+  kode: string
+): PekerjaRow {
+  return { id, nomorAbsen, namaPekerja, nik, kode, detailPekerja: buildDetailPekerja(nomorAbsen, namaPekerja, nik) };
+}
+
 const MOCK_MEJA: MejaGroup[] = [
   {
     nomorMeja: 1,
     pekerja: [
-      { id: 1, namaPekerja: 'SUWARTI', nik: '0009FE1', kode: '1' },
-      { id: 2, namaPekerja: 'Aminah', nik: '0010FD1', kode: '2' },
-      { id: 3, namaPekerja: 'Maslikah', nik: '0012FD1', kode: '3' },
-      { id: 4, namaPekerja: 'ALFIYAH', nik: '0008FB2', kode: 'A' },
-      { id: 5, namaPekerja: 'SUNARTI', nik: '0032FE2', kode: 'B' },
+      mockPekerja(1, 'GT009', 'SUWARTI', '0009FE1', '1'),
+      mockPekerja(2, 'GT010', 'Aminah', '0010FD1', '2'),
+      mockPekerja(3, 'GT012', 'Maslikah', '0012FD1', '3'),
+      mockPekerja(4, 'GL008', 'ALFIYAH', '0008FB2', 'A'),
+      mockPekerja(5, 'GT032', 'SUNARTI', '0032FE2', 'B'),
     ],
   },
   {
     nomorMeja: 2,
     pekerja: [
-      { id: 6, namaPekerja: 'Crysa Umami', nik: '0022FD1', kode: '1' },
-      { id: 7, namaPekerja: 'MISKIYATUN', nik: '0023FE1', kode: '2' },
-      { id: 8, namaPekerja: 'Kemisrah', nik: '0020FD1', kode: '3' },
+      mockPekerja(6, 'GT022', 'Crysa Umami', '0022FD1', '1'),
+      mockPekerja(7, 'GT023', 'MISKIYATUN', '0023FE1', '2'),
+      mockPekerja(8, 'GT020', 'Kemisrah', '0020FD1', '3'),
     ],
   },
 ];

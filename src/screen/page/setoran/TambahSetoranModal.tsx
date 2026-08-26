@@ -45,11 +45,12 @@ interface TambahSetoranModalProps {
   mejaOptions?: number[];
   onChangeMeja?: (nomorMeja: number) => void;
   // Every meja's roster (who's seated where, and as which kode) — a scan
-  // is only accepted for Pekerja Giling/Batil if the scanned NIK is
-  // actually seated at `nomorMeja`, and only in the matching role (numeric
-  // kode = Giling, alpha kode = Batil). Scanning is otherwise wide open to
-  // the whole master pekerja directory, which would let anyone from any
-  // meja (or the wrong role at this meja) get logged against this setoran.
+  // is only accepted for Pekerja Giling/Batil if the scanned pekerja
+  // (identified by `detailPekerja`, not NIK alone) is actually seated at
+  // `nomorMeja`, and only in the matching role (numeric kode = Giling,
+  // alpha kode = Batil). Scanning is otherwise wide open to the whole
+  // master pekerja directory, which would let anyone from any meja (or the
+  // wrong role at this meja) get logged against this setoran.
   mejaGroups: MejaGroup[];
   setoranKe: number;
   isSubmitting?: boolean;
@@ -65,6 +66,13 @@ interface TambahSetoranModalProps {
   scannedGiling?: MasterPekerja | null;
   scannedBatil?: MasterPekerja | null;
   scannedTrayCode?: string | null;
+  // Bumped by the parent on every single tray scan resolution, even ones
+  // that hand back the exact same code as before. Needed because
+  // scannedTrayCode alone can't be trusted to *change* on a repeat scan of
+  // the same tray (React bails out of a setState that reuses the same
+  // primitive value, so a same-code rescan wouldn't otherwise re-trigger
+  // the duplicate-check effect below) — see its usage in the tray useEffect.
+  scannedTrayToken?: number;
 }
 
 export default function TambahSetoranModal({
@@ -89,6 +97,7 @@ export default function TambahSetoranModal({
   scannedGiling,
   scannedBatil,
   scannedTrayCode,
+  scannedTrayToken,
 }: TambahSetoranModalProps) {
   const [giling, setGiling] = useState<MasterPekerja | null>(null);
   const [batil, setBatil] = useState<MasterPekerja | null>(null);
@@ -141,21 +150,24 @@ export default function TambahSetoranModal({
   // Giling (numeric) kode there — anyone else is rejected outright. Note
   // there's deliberately no "already picked as Batil" guard here: a pekerja
   // can hold BOTH a Giling and a Batil kode at the same meja (see
-  // TambahPekerjaModal's dual-role rule), so the same NIK legitimately
+  // TambahPekerjaModal's dual-role rule), so the same pekerja legitimately
   // filling both slots in one setoran is the correct outcome, not an error
-  // — the seat check below (via `.some()` across every row for this NIK,
-  // not just the first match) is what actually decides eligibility.
+  // — the seat check below (via `.some()` across every row matching this
+  // pekerja's `detailPekerja`, not just the first match) is what actually
+  // decides eligibility.
   useEffect(() => {
     if (!scannedGiling) return;
-    const seatsForNik = currentMejaPekerja.filter((p) => p.nik === scannedGiling.nik);
-    if (seatsForNik.length === 0) {
+    const seatsForPekerja = currentMejaPekerja.filter(
+      (p) => p.detailPekerja === scannedGiling.detailPekerja
+    );
+    if (seatsForPekerja.length === 0) {
       setScanError({
         title: 'Tidak Bisa Digunakan',
         message: `${scannedGiling.namaPekerja} tidak terdaftar di Meja ${nomorMeja}.`,
       });
       return;
     }
-    if (!seatsForNik.some((p) => isNumericCode(p.kode))) {
+    if (!seatsForPekerja.some((p) => isNumericCode(p.kode))) {
       setScanError({
         title: 'Tidak Bisa Digunakan',
         message: `${scannedGiling.namaPekerja} terdaftar sebagai Batil di Meja ${nomorMeja}, bukan Giling.`,
@@ -170,22 +182,25 @@ export default function TambahSetoranModal({
   // Only accepted if they're actually seated at this meja AND hold the
   // Batil (alpha) kode there — anyone else is rejected outright. Same
   // dual-role reasoning as the Giling effect above: no "already picked as
-  // Giling" guard, since the same NIK can legitimately fill both slots.
+  // Giling" guard, since the same pekerja can legitimately fill both slots.
   // groupWorkersByMeja sorts Giling (numeric) rows first, so a naive
   // `.find()` here would always land on their Giling row and wrongly
   // reject a dual-role pekerja's Batil scan — `.some()` across every row
-  // for this NIK is what makes the check correct.
+  // matching this pekerja's `detailPekerja` is what makes the check
+  // correct.
   useEffect(() => {
     if (!scannedBatil) return;
-    const seatsForNik = currentMejaPekerja.filter((p) => p.nik === scannedBatil.nik);
-    if (seatsForNik.length === 0) {
+    const seatsForPekerja = currentMejaPekerja.filter(
+      (p) => p.detailPekerja === scannedBatil.detailPekerja
+    );
+    if (seatsForPekerja.length === 0) {
       setScanError({
         title: 'Tidak Bisa Digunakan',
         message: `${scannedBatil.namaPekerja} tidak terdaftar di Meja ${nomorMeja}.`,
       });
       return;
     }
-    if (!seatsForNik.some((p) => !isNumericCode(p.kode))) {
+    if (!seatsForPekerja.some((p) => !isNumericCode(p.kode))) {
       setScanError({
         title: 'Tidak Bisa Digunakan',
         message: `${scannedBatil.namaPekerja} terdaftar sebagai Giling di Meja ${nomorMeja}, bukan Batil.`,
@@ -199,12 +214,28 @@ export default function TambahSetoranModal({
   // Pick up a freshly scanned tray barcode and resolve it to a batang
   // count (see resolveBarcodeTray in sktApi.ts — placeholder until a real
   // master tray/batch table exists).
+  //
+  // A Nomor Tray already used earlier in THIS setoran is rejected outright
+  // — one physical tray can't be counted twice toward the same submission.
+  // The same Nomor Tray is fine again in a different Tambah Setoran
+  // transaction: barcodeTrays always starts empty for a fresh transaction
+  // (see the "no reset on `visible`" note above — a genuinely new dialog
+  // comes from the parent's bumped `key`, which re-initializes this
+  // useState for free), so this check only ever looks at trays already
+  // scanned within the transaction currently open.
+  //
+  // Keyed on `scannedTrayToken`, not `scannedTrayCode` — the parent bumps
+  // the token on every scan resolution, including a repeat scan of the
+  // exact same code. Keying on the code alone would miss that case: React
+  // bails out of a parent setState that reuses the same primitive string,
+  // so re-scanning the same already-used tray back-to-back would silently
+  // do nothing instead of showing "Nomor Tray Sudah Terpakai".
   useEffect(() => {
     if (!scannedTrayCode) return;
     if (barcodeTrays.some((t) => t.code === scannedTrayCode)) {
       setScanError({
-        title: 'Barcode Sudah Discan',
-        message: `Tray ${scannedTrayCode} sudah ada di daftar.`,
+        title: 'Nomor Tray Sudah Terpakai',
+        message: `Nomor Tray ${scannedTrayCode} sudah discan di setoran ini. Nomor Tray yang sama masih bisa dipakai di transaksi Tambah Setoran lain.`,
       });
       return;
     }
@@ -231,7 +262,7 @@ export default function TambahSetoranModal({
       isCancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scannedTrayCode]);
+  }, [scannedTrayToken]);
 
   useEffect(() => {
     if (!visible) return;
@@ -255,6 +286,16 @@ export default function TambahSetoranModal({
 
   const handleSubmit = () => {
     if (!giling || !batil) return;
+    // Belt-and-suspenders alongside canSubmit disabling the button below —
+    // every setoran must carry at least one Nomor Tray, so this can never
+    // go through with an empty barcodeTrays list.
+    if (barcodeTrays.length === 0) {
+      setScanError({
+        title: 'Nomor Tray Belum Discan',
+        message: 'Setoran harus memiliki minimal satu Nomor Tray sebelum disimpan.',
+      });
+      return;
+    }
     onSubmit({
       sktHeaderId,
       nomorMeja,

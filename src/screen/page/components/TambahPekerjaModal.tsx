@@ -21,22 +21,26 @@ const ALL_CODES = ['1', '2', '3', 'A', 'B'];
 
 // True once a pekerja already holds one numeric (giling) code AND one
 // alpha (batil) code in this meja — at that point they're fully occupied
-// and can't take on a third role here.
-function hasBothRoles(nik: string, existingPekerja: PekerjaRow[]): boolean {
-  const codes = existingPekerja.filter((p) => p.nik === nik).map((p) => p.kode);
+// and can't take on a third role here. Identity is keyed on `detailPekerja`
+// ("nomor_absen - nama_pekerja - nik"), not NIK alone.
+function hasBothRoles(detailPekerja: string, existingPekerja: PekerjaRow[]): boolean {
+  const codes = existingPekerja
+    .filter((p) => p.detailPekerja === detailPekerja)
+    .map((p) => p.kode);
   return codes.some(isNumericCode) && codes.some((c) => !isNumericCode(c));
 }
 
-// A pekerja can only ever sit at one meja per SKT header — if their NIK is
+// A pekerja can only ever sit at one meja per SKT header — if they're
 // already registered on some OTHER meja, they can't be added here too.
-// Returns that meja's nomor, or null if `nik` isn't seated anywhere else.
+// Returns that meja's nomor, or null if `detailPekerja` isn't seated
+// anywhere else.
 function findOtherMeja(
-  nik: string,
+  detailPekerja: string,
   mejaGroups: MejaGroup[],
   currentMeja: number | null
 ): number | null {
   const other = mejaGroups.find(
-    (g) => g.nomorMeja !== currentMeja && g.pekerja.some((p) => p.nik === nik)
+    (g) => g.nomorMeja !== currentMeja && g.pekerja.some((p) => p.detailPekerja === detailPekerja)
   );
   return other ? other.nomorMeja : null;
 }
@@ -117,16 +121,9 @@ export default function TambahPekerjaModal({
     };
   }, [visible, brakId]);
 
-  // AbsensiScanScreen is lazy-loaded (see AppNavigation.tsx) so a linking
-  // issue in the camera libraries can't crash the whole app. That means its
-  // first `require()` — which initializes react-native-vision-camera and
-  // the barcode scanner's native bindings — normally happens on the user's
-  // tap of "Scan", making that first navigation visibly pause. Warming it
-  // here, as soon as this dialog opens, moves that cost off the tap.
-  useEffect(() => {
-    if (!visible) return;
-    import('../absensi/AbsensiScanScreen').catch(() => {});
-  }, [visible]);
+  // AbsensiScanScreen's lazy chunk is now warmed once up front, as soon as
+  // the navigator mounts (see mainNavigation.tsx) — no need to repeat that
+  // here every time this dialog opens.
 
   // Pre-fill the search box and selection whenever a fresh scan result
   // arrives from AbsensiScanScreen — this is the "just scan the ID card"
@@ -135,13 +132,13 @@ export default function TambahPekerjaModal({
   useEffect(() => {
     if (!scannedPekerja) return;
 
-    const otherMeja = findOtherMeja(scannedPekerja.nik, mejaGroups, nomorMeja);
+    const otherMeja = findOtherMeja(scannedPekerja.detailPekerja, mejaGroups, nomorMeja);
     if (otherMeja !== null) {
       setErrorMessage(`Sudah Terdaftar di Meja ${otherMeja}`);
       return;
     }
 
-    if (hasBothRoles(scannedPekerja.nik, existingPekerja)) {
+    if (hasBothRoles(scannedPekerja.detailPekerja, existingPekerja)) {
       setErrorMessage('Sudah Terdaftar Sebagai Giling dan Batil');
       return;
     }
@@ -169,7 +166,9 @@ export default function TambahPekerjaModal({
   // block, not a code-availability question.)
   const usedCodesInMeja = new Set(existingPekerja.map((p) => p.kode));
   const selectedPekerjaCodesInMeja = selectedPekerja
-    ? existingPekerja.filter((p) => p.nik === selectedPekerja.nik).map((p) => p.kode)
+    ? existingPekerja
+        .filter((p) => p.detailPekerja === selectedPekerja.detailPekerja)
+        .map((p) => p.kode)
     : [];
   const alreadyHasNumeric = selectedPekerjaCodesInMeja.some(isNumericCode);
   const alreadyHasAlpha = selectedPekerjaCodesInMeja.some((c) => !isNumericCode(c));
@@ -200,13 +199,13 @@ export default function TambahPekerjaModal({
   };
 
   const handleSelectPekerja = (pekerja: MasterPekerja) => {
-    const otherMeja = findOtherMeja(pekerja.nik, mejaGroups, nomorMeja);
+    const otherMeja = findOtherMeja(pekerja.detailPekerja, mejaGroups, nomorMeja);
     if (otherMeja !== null) {
       setErrorMessage(`Sudah Terdaftar di Meja ${otherMeja}`);
       return;
     }
 
-    if (hasBothRoles(pekerja.nik, existingPekerja)) {
+    if (hasBothRoles(pekerja.detailPekerja, existingPekerja)) {
       setErrorMessage('Sudah Terdaftar Sebagai Giling dan Batil');
       return;
     }

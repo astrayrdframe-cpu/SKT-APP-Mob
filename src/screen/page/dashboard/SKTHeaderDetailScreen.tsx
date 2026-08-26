@@ -12,35 +12,27 @@ import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { RootStackParamList } from '../../navigation/mainNavigation';
 import {
-  fetchSktDetail,
+  // fetchSktDetail, // GET disabled here on purpose — being wired up elsewhere. See loadDetail below.
   addPekerjaToMeja,
   deletePekerjaFromMeja,
   submitSetoran,
   SubmitSetoranPayload,
 } from '../../../services/API/sktApi';
 import { SKTDetail, SetoranWorker } from '../../../services/skt';
-import { saveToCache, loadFromCache, sktDetailCacheKey } from '../../../services/persistence';
+import { saveToCache, loadFromCache, sktDetailCacheKey } from '../../../services/Offline/persistence';
 import { useOffline } from '../../../context/OfflineContext';
 import DetailMejaModal from '../components/DetailMejaModal';
 import TambahPekerjaModal from '../components/TambahPekerjaModal';
 import TambahSetoranModal from '../setoran/TambahSetoranModal';
-import { groupWorkersByMeja } from '../../../utils/mejaGrouping';
+import { groupWorkersByMeja, pairSetoranByMeja } from '../../../utils/mejaGrouping';
 import { MasterPekerja } from '../../../services/pekerja';
 
 type DetailRouteProp = RouteProp<RootStackParamList, 'SKTHeaderDetail'>;
 type NavProp = NativeStackNavigationProp<RootStackParamList, 'SKTHeaderDetail'>;
 
-const AVATAR_COLORS = ['#7C3AED', '#2F5FD1'];
-
 interface CachedDetail {
   detail: SKTDetail;
   workers: SetoranWorker[];
-}
-
-function formatTime(iso: string): string {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  return d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
 }
 
 export default function SKTHeaderDetailScreen() {
@@ -81,16 +73,25 @@ export default function SKTHeaderDetailScreen() {
   const [scannedSetoranGiling, setScannedSetoranGiling] = useState<MasterPekerja | null>(null);
   const [scannedSetoranBatil, setScannedSetoranBatil] = useState<MasterPekerja | null>(null);
   const [scannedTrayCode, setScannedTrayCode] = useState<string | null>(null);
+  // Bumped alongside scannedTrayCode on every tray scan resolution — see
+  // TambahSetoranModal's `scannedTrayToken` prop comment for why a plain
+  // code-only signal can miss a same-code rescan.
+  const [scannedTrayToken, setScannedTrayToken] = useState(0);
 
   const loadDetail = useCallback(async () => {
     setIsLoading(true);
     setError(null);
+    // GET call disabled here on purpose — fetching this detail is being
+    // moved elsewhere. For now this only reads whatever's already saved
+    // locally (see src/services/Offline/persistence.ts), falling back to
+    // the `preview` passed in via navigation if there's no cache yet.
+    // try {
+    //   const data = await fetchSktDetail(id);
+    //   setDetail(data.detail);
+    //   setWorkers(data.workers);
+    //   await saveToCache(sktDetailCacheKey(id), data);
+    // } catch {
     try {
-      const data = await fetchSktDetail(id);
-      setDetail(data.detail);
-      setWorkers(data.workers);
-      await saveToCache(sktDetailCacheKey(id), data);
-    } catch {
       const cached = await loadFromCache<CachedDetail>(sktDetailCacheKey(id));
       if (cached) {
         setDetail(cached.detail);
@@ -107,6 +108,20 @@ export default function SKTHeaderDetailScreen() {
   useEffect(() => {
     loadDetail();
   }, [loadDetail]);
+
+  // Every local transaction (add/delete pekerja, submit setoran) below
+  // writes its resulting worker list back here immediately, so it's on
+  // disk in AsyncStorage — not just sitting in React state — the moment
+  // it happens. That's what makes it durable across a screen remount, an
+  // app restart, or a logout (clearAuth only removes the auth-* keys, see
+  // src/store/authStore.tsx, so this cache is untouched by sign-out).
+  const persistWorkers = useCallback(
+    async (updatedWorkers: SetoranWorker[]) => {
+      if (!detail) return;
+      await saveToCache(sktDetailCacheKey(id), { detail, workers: updatedWorkers });
+    },
+    [detail, id]
+  );
 
   const mejaTabs = useMemo(() => {
     const count = detail?.jumlahMeja ?? 0;
@@ -128,6 +143,11 @@ export default function SKTHeaderDetailScreen() {
     if (selectedMeja === 'Semua Meja') return workers;
     return workers.filter((w) => w.nomorMeja === selectedMeja);
   }, [workers, selectedMeja]);
+
+  // List Setoran shows one card per Tambah Setoran submission — Giling
+  // paired with its Batil counterpart, not one card per worker row (see
+  // pairSetoranByMeja in utils/mejaGrouping.ts for the pairing rule).
+  const setoranPairs = useMemo(() => pairSetoranByMeja(filteredWorkers), [filteredWorkers]);
 
   // Real MejaGroup[] derived from `workers` — this is what DetailMejaModal
   // actually needs (it was previously being passed brakId/jumlahMeja/workers,
@@ -161,23 +181,26 @@ export default function SKTHeaderDetailScreen() {
     setScannedSetoranGiling(null);
     setScannedSetoranBatil(null);
     setScannedTrayCode(null);
+    setScannedTrayToken(0);
     setSetoranMejaOverride(null);
     setTambahSetoranKey((k) => k + 1);
     setShowTambahSetoran(true);
   };
 
   // Shared by all three scans inside TambahSetoranModal — hides the
-  // dialog, navigates to AbsensiScan configured for that scan's target,
-  // then reopens the dialog once the scanner resolves or is cancelled.
-  // Same "hide → navigate → reopen" shape as handleAddPekerja below.
+  // dialog, navigates to the scanner for that scan's target (AbsensiScan
+  // for Giling/Batil against skt_master_pekerja; the dedicated
+  // BarcodeTrayScan for Barcode Tray against skt/test_temp), then reopens
+  // the dialog once the scanner resolves or is cancelled. Same "hide →
+  // navigate → reopen" shape as handleAddPekerja below.
   const handlePressScanSetoran = (target: 'giling' | 'batil' | 'tray') => {
     setShowTambahSetoran(false);
 
     if (target === 'tray') {
-      navigation.navigate('AbsensiScan', {
-        mode: 'barcode',
+      navigation.navigate('BarcodeTrayScan', {
         onScannedCode: (code) => {
           setScannedTrayCode(code);
+          setScannedTrayToken((t) => t + 1);
           setShowTambahSetoran(true);
         },
         onCancelled: () => setShowTambahSetoran(true),
@@ -200,7 +223,9 @@ export default function SKTHeaderDetailScreen() {
     setIsSubmittingSetoran(true);
     try {
       const newWorkers = await submitSetoran(payload);
-      setWorkers((prev) => [...prev, ...newWorkers]);
+      const updatedWorkers = [...workers, ...newWorkers];
+      setWorkers(updatedWorkers);
+      await persistWorkers(updatedWorkers);
       setShowTambahSetoran(false);
     } catch {
       Alert.alert(
@@ -231,7 +256,9 @@ export default function SKTHeaderDetailScreen() {
           setDeletingPekerjaId(pekerjaId);
           try {
             await deletePekerjaFromMeja({ sktHeaderId: item.id, nomorMeja, pekerjaId });
-            setWorkers((prev) => prev.filter((w) => w.id !== pekerjaId));
+            const updatedWorkers = workers.filter((w) => w.id !== pekerjaId);
+            setWorkers(updatedWorkers);
+            await persistWorkers(updatedWorkers);
           } catch {
             Alert.alert(
               'Gagal Menghapus',
@@ -261,7 +288,9 @@ export default function SKTHeaderDetailScreen() {
         namaPekerja: pekerja.namaPekerja,
         nomorAbsen: pekerja.nomorAbsen,
       });
-      setWorkers((prev) => [...prev, newWorker]);
+      const updatedWorkers = [...workers, newWorker];
+      setWorkers(updatedWorkers);
+      await persistWorkers(updatedWorkers);
     } catch {
       Alert.alert(
         'Gagal Menambahkan',
@@ -408,40 +437,48 @@ export default function SKTHeaderDetailScreen() {
           <Text style={styles.setoranHeaderText}>List Setoran</Text>
         </View>
 
-        {filteredWorkers.length === 0 ? (
+        {setoranPairs.length === 0 ? (
           <Text style={styles.emptyText}>No setoran entries for this meja yet.</Text>
         ) : (
           <View style={styles.setoranListWrapper}>
-            {filteredWorkers.map((worker, index) => (
-              <View key={worker.id} style={styles.setoranCard}>
-                <View style={styles.setoranTopRow}>
-                  <View style={styles.setoranNameRow}>
-                    <View style={styles.codeCircle}>
-                      <Text style={styles.codeCircleText}>{worker.kodeSetoran}</Text>
-                    </View>
-                    <Text style={styles.setoranName}>{worker.namaPekerja}</Text>
-                  </View>
-                  <View
-                    style={[
-                      styles.avatarSmall,
-                      { backgroundColor: AVATAR_COLORS[index % AVATAR_COLORS.length] },
-                    ]}
-                  >
-                    <Text style={styles.avatarSmallText}>{worker.nomorAbsen.slice(-2)}</Text>
+            {setoranPairs.map((pair) => (
+              <View key={pair.key} style={styles.setoranCard}>
+                <View style={styles.pairTopRow}>
+                  <Text style={styles.pairMejaLabel}>Meja {pair.nomorMeja}</Text>
+                  <View style={styles.pairSetoranBadge}>
+                    <Text style={styles.pairSetoranBadgeText}>Setoran #{pair.setoranKe}</Text>
                   </View>
                 </View>
 
-                <View style={styles.setoranStatsRow}>
-                  <Text style={styles.goodText}>Good: {worker.totalSetoran}</Text>
-                  <Text style={styles.badText}>Bad: {worker.totalDefect}</Text>
+                <View style={styles.pairNamesRow}>
+                  <View style={styles.pairSide}>
+                    <View style={styles.codeCircle}>
+                      <Text style={styles.codeCircleText}>{pair.giling?.kodeSetoran ?? '1'}</Text>
+                    </View>
+                    <Text style={styles.pairSideName} numberOfLines={1}>
+                      {pair.giling?.namaPekerja ?? '—'}
+                    </Text>
+                  </View>
+                  <View style={[styles.pairSide, styles.pairSideRight]}>
+                    <Text
+                      style={[styles.pairSideName, styles.pairSideNameRight]}
+                      numberOfLines={1}
+                    >
+                      {pair.batil?.namaPekerja ?? '—'}
+                    </Text>
+                    <View style={[styles.codeCircle, styles.codeCircleAlt]}>
+                      <Text style={[styles.codeCircleText, styles.codeCircleTextAlt]}>
+                        {pair.batil?.kodeSetoran ?? 'A'}
+                      </Text>
+                    </View>
+                  </View>
                 </View>
 
                 <View style={styles.setoranMetaRow}>
-                  <Text style={styles.metaText}>
-                    {formatTime(worker.jamMasuk)}–{formatTime(worker.jamKeluar)}
-                  </Text>
-                  <View style={styles.mejaBadge}>
-                    <Text style={styles.mejaBadgeText}>Meja {worker.nomorMeja}</Text>
+                  <Text style={styles.pairTrayText}>{pair.trayCount} Selongsong</Text>
+                  <View style={styles.setoranStatsRow}>
+                    <Text style={styles.goodText}>Good: {pair.good}</Text>
+                    <Text style={styles.badText}>Bad: {pair.bad}</Text>
                   </View>
                 </View>
               </View>
@@ -531,6 +568,7 @@ export default function SKTHeaderDetailScreen() {
         scannedGiling={scannedSetoranGiling}
         scannedBatil={scannedSetoranBatil}
         scannedTrayCode={scannedTrayCode}
+        scannedTrayToken={scannedTrayToken}
       />
     </View>
   );
@@ -621,8 +659,25 @@ const styles = StyleSheet.create({
     elevation: 1,
     gap: 6,
   },
-  setoranTopRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  setoranNameRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  // Top row of a pair card: "Meja N" (gray, left) + "Setoran #N" pill
+  // (blue, right).
+  pairTopRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  pairMejaLabel: { fontSize: 11, fontWeight: '600', color: '#98A2B3' },
+  pairSetoranBadge: {
+    backgroundColor: '#EAF0FF',
+    borderRadius: 10,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  pairSetoranBadgeText: { fontSize: 10, fontWeight: '700', color: '#2F5FD1' },
+  // Middle row: Giling (role circle + name) on the left, Batil (name +
+  // role circle) on the right — one card per paired submission instead of
+  // one card per worker row.
+  pairNamesRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  pairSide: { flexDirection: 'row', alignItems: 'center', gap: 8, flexShrink: 1, maxWidth: '48%' },
+  pairSideRight: { justifyContent: 'flex-end' },
+  pairSideName: { flexShrink: 1, fontSize: 12, fontWeight: '700', color: '#101828' },
+  pairSideNameRight: { textAlign: 'right' },
   codeCircle: {
     width: 22,
     height: 22,
@@ -632,27 +687,16 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   codeCircleText: { fontSize: 11, fontWeight: '700', color: '#2F5FD1' },
-  avatarSmall: {
-    width: 22,
-    height: 22,
-    borderRadius: 11,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  avatarSmallText: { fontSize: 9, fontWeight: '700', color: '#FFFFFF' },
-  setoranName: { fontSize: 12, fontWeight: '700', color: '#101828' },
+  // Batil's role circle (alpha kode) gets the same purple used for the
+  // avatar dots elsewhere in this screen, so Giling/Batil read as visually
+  // distinct roles at a glance.
+  codeCircleAlt: { backgroundColor: '#F3E8FF' },
+  codeCircleTextAlt: { color: '#7C3AED' },
   setoranStatsRow: { flexDirection: 'row', gap: 16 },
   goodText: { fontSize: 12, fontWeight: '600', color: '#12B76A' },
   badText: { fontSize: 12, fontWeight: '600', color: '#D92D20' },
   setoranMetaRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  metaText: { fontSize: 11, color: '#667085' },
-  mejaBadge: {
-    backgroundColor: '#F2F4F7',
-    borderRadius: 10,
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-  },
-  mejaBadgeText: { fontSize: 10, fontWeight: '600', color: '#475467' },
+  pairTrayText: { fontSize: 12, fontWeight: '600', color: '#344054' },
   footer: {
     padding: 16,
     backgroundColor: '#F7F8FA',

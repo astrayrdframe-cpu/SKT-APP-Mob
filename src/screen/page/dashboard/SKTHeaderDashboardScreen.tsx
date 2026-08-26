@@ -13,13 +13,21 @@ import {
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import Icon from 'react-native-vector-icons/FontAwesome5';
-import { fetchSktHeaderList } from '../../../services/API/sktApi';
-import { SKTHeaderItem } from '../../../services/skt';
-import { saveToCache, loadFromCache, CACHE_KEYS } from '../../../services/persistence';
+import { fetchSktHeaderList, fetchAllSktDetails, fetchTestTempData } from '../../../services/API/sktApi';
+import { SKTHeaderItem, SKTDetail, SetoranWorker, TestTempRow } from '../../../services/skt';
+import {
+  saveToCache,
+  loadFromCache,
+  removeFromCache,
+  CACHE_KEYS,
+  sktDetailCacheKey,
+} from '../../../services/Offline/persistence';
 import { useOffline } from '../../../context/OfflineContext';
 import { useAuthStore } from '../../../store/authStore';
 import { getServerNow } from '../../../services/serverTime';
 import type { RootStackParamList } from '../../navigation/mainNavigation';
+import SinkronisasiDataModal from '../components/SinkronisasiDataModal';
+import ConfirmationModal from '../components/ConfirmationModal';
 
 type NavProp = NativeStackNavigationProp<RootStackParamList, 'SKTHeaderDashboard'>;
 
@@ -35,6 +43,14 @@ function greetingForHour(hour: number): string {
   return 'Good Evening';
 }
 
+// Plain JSON-shape equality — every value that flows through here (SKT
+// list items, detail/workers pairs, test_temp rows) is a serializable
+// object built the same way on every fetch, so a stringify compare is
+// enough to tell "actually changed" from "same data came back again".
+function isSameCachedValue(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
 export default function SKTHeaderDashboardScreen() {
   const navigation = useNavigation<NavProp>();
   const { isOffline } = useOffline();
@@ -46,6 +62,7 @@ export default function SKTHeaderDashboardScreen() {
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isSyncModalVisible, setIsSyncModalVisible] = useState(false);
 
   // Ticks once a minute so the greeting below doesn't go stale (e.g. "Good
   // Morning" lingering past noon) if the dashboard is left open across a
@@ -65,6 +82,32 @@ export default function SKTHeaderDashboardScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [minuteTick, isLoading, isRefreshing]
   );
+
+  // Picking Get Data / Push Data in the sync sheet doesn't run the action
+  // right away — it stages which one was picked and hands off to the
+  // "Apakah kamu yakin?" confirmation dialog below, since both can clobber
+  // unsaved changes (local or server-side).
+  const [pendingSyncAction, setPendingSyncAction] = useState<'get' | 'push' | null>(null);
+
+  const handleSelectGetData = () => {
+    setIsSyncModalVisible(false);
+    setPendingSyncAction('get');
+  };
+
+  const handleSelectPushData = () => {
+    setIsSyncModalVisible(false);
+    setPendingSyncAction('push');
+  };
+
+  const handleConfirmSyncAction = () => {
+    const action = pendingSyncAction;
+    setPendingSyncAction(null);
+    if (action === 'get') {
+      syncAllFromOrds();
+    }
+    // 'push': no local write-queue exists yet to push, so this is a no-op
+    // for now — hook up once that's in place.
+  };
 
   const handleLogout = () => {
     Alert.alert('Sign Out', 'Are you sure you want to sign out?', [
@@ -98,6 +141,77 @@ export default function SKTHeaderDashboardScreen() {
     loadData();
   }, [loadData]);
 
+  // "Get Data" (Sinkronisasi Data → confirmed) — a full resync from ORDS,
+  // not just the summary list loadData() pulls for pull-to-refresh. Fetches
+  // every header's detail + worker rows in one pass via fetchAllSktDetails
+  // and REPLACES the cache with it — overwriting each header's cached
+  // detail (so SKTHeaderDetailScreen's offline cache is current too), and
+  // deleting any cached detail whose id isn't in this fetch anymore, so a
+  // record removed server-side doesn't linger locally after a sync. This
+  // is the live GET that loadDetail there leaves commented out, run for
+  // every record at once from here instead.
+  const syncAllFromOrds = useCallback(async () => {
+    setIsRefreshing(true);
+    setError(null);
+    try {
+      const previousList = (await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST)) ?? [];
+      const details = await fetchAllSktDetails();
+      const list: SKTHeaderItem[] = details.map(({ detail }) => detail);
+      const freshIds = new Set(list.map((item) => item.id));
+
+      setItems(list);
+
+      // Only overwrite each cache entry if ORDS actually returned
+      // something different from what's already cached — an unchanged
+      // fetch is a no-op write, not a fresh replace.
+      if (!isSameCachedValue(previousList, list)) {
+        await saveToCache(CACHE_KEYS.SKT_LIST, list);
+      }
+
+      await Promise.all(
+        details.map(async ({ detail, workers }) => {
+          const cacheKey = sktDetailCacheKey(detail.id);
+          const previousDetail = await loadFromCache<{ detail: SKTDetail; workers: SetoranWorker[] }>(
+            cacheKey
+          );
+          const freshDetail = { detail, workers };
+          if (!isSameCachedValue(previousDetail, freshDetail)) {
+            await saveToCache(cacheKey, freshDetail);
+          }
+        })
+      );
+
+      const staleIds = previousList
+        .filter((item) => !freshIds.has(item.id))
+        .map((item) => item.id);
+      await Promise.all(staleIds.map((id) => removeFromCache(sktDetailCacheKey(id))));
+
+      // skt/test_temp is an unrelated standalone table — fetched and
+      // compared alongside the real resync, but its failure shouldn't fail
+      // (or fall back) the SKT data above, so it gets its own try/catch.
+      try {
+        const previousTestTemp = await loadFromCache<TestTempRow[]>(CACHE_KEYS.TEST_TEMP);
+        const testTempRows = await fetchTestTempData();
+        if (!isSameCachedValue(previousTestTemp, testTempRows)) {
+          await saveToCache(CACHE_KEYS.TEST_TEMP, testTempRows);
+        }
+      } catch (testTempError) {
+        console.warn('Failed to refresh skt/test_temp:', testTempError);
+      }
+    } catch {
+      // Fall back to the last cached list — likely offline, or the
+      // endpoint is temporarily unreachable.
+      const cached = await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST);
+      if (cached && cached.length > 0) {
+        setItems(cached);
+      } else {
+        setError('Unable to load SKT data. Pull down to try again.');
+      }
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, []);
+
   const filteredItems = items.filter((item) =>
     `${item.brakId} ${item.brand}`.toLowerCase().includes(query.toLowerCase())
   );
@@ -112,12 +226,19 @@ export default function SKTHeaderDashboardScreen() {
     <View style={styles.screen}>
       {/* Top bar */}
       <View style={styles.topBar}>
-        <Text style={styles.menuIcon}>☰</Text>
         <Text style={styles.topBarTitle}>SKT NTI</Text>
         <View style={styles.topBarActions}>
           <View style={styles.avatarCircle}>
             <Text style={styles.avatarGlyph}>◍</Text>
           </View>
+          <TouchableOpacity
+            style={styles.refreshButton}
+            onPress={() => setIsSyncModalVisible(true)}
+            activeOpacity={0.7}
+            accessibilityLabel="Refresh"
+          >
+            <Icon name="sync-alt" size={16} color="#FFFFFF" solid />
+          </TouchableOpacity>
           <TouchableOpacity
             style={styles.logoutButton}
             onPress={handleLogout}
@@ -219,6 +340,25 @@ export default function SKTHeaderDashboardScreen() {
           />
         )}
       </View>
+
+      <SinkronisasiDataModal
+        visible={isSyncModalVisible}
+        onClose={() => setIsSyncModalVisible(false)}
+        onGetData={handleSelectGetData}
+        onPushData={handleSelectPushData}
+      />
+
+      <ConfirmationModal
+        visible={pendingSyncAction !== null}
+        title="Apakah kamu yakin?"
+        message={
+          pendingSyncAction === 'push'
+            ? 'Data di server akan diperbarui dengan data lokal. Perubahan yang belum tersimpan di server mungkin akan tertimpan.'
+            : 'Data lokal akan diperbarui dengan data terbaru dari server. Perubahan yang belum tersimpan mungkin akan tertimpan.'
+        }
+        onCancel={() => setPendingSyncAction(null)}
+        onConfirm={handleConfirmSyncAction}
+      />
     </View>
   );
 }
@@ -234,7 +374,6 @@ const styles = StyleSheet.create({
     paddingTop: 54,
     paddingBottom: 16,
   },
-  menuIcon: { color: '#FFFFFF', fontSize: 20 },
   topBarTitle: { color: '#FFFFFF', fontSize: 17, fontWeight: '700' },
   topBarActions: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   avatarCircle: {
@@ -246,6 +385,14 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   avatarGlyph: { color: '#2F5FD1', fontSize: 14 },
+  refreshButton: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   logoutButton: {
     width: 30,
     height: 30,

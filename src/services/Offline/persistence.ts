@@ -23,10 +23,19 @@ export async function loadFromCache<T>(key: string): Promise<T | null> {
   }
 }
 
+export async function removeFromCache(key: string): Promise<void> {
+  try {
+    await AsyncStorage.removeItem(key);
+  } catch (error) {
+    console.warn(`Failed to remove cache "${key}":`, error);
+  }
+}
+
 export const CACHE_KEYS = {
   NAV_STATE: 'nav-state',
   FILTER_DATA: 'skt-filter-data',
   SKT_LIST: 'skt-header-list-v2', // bumped: v1 shape is incompatible with current SKTHeaderItem
+  TEST_TEMP: 'skt-test-temp', // skt/test_temp rows, refreshed on Dashboard "Get Data"
 } as const;
 
 // Each SKT detail record is cached individually, keyed by its id, so a

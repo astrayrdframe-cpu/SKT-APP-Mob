@@ -13,7 +13,7 @@ import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { RootStackParamList } from '../../navigation/mainNavigation';
 import { fetchSetoranSummary } from '../../../services/API/sktApi';
 import { SetoranSummary, MejaSummary, PekerjaPair } from '../../../services/skt';
-import { saveToCache, loadFromCache, setoranSummaryCacheKey } from '../../../services/persistence';
+import { saveToCache, loadFromCache, setoranSummaryCacheKey } from '../../../services/Offline/persistence';
 import { useOffline } from '../../../context/OfflineContext';
 
 type SummaryRouteProp = RouteProp<RootStackParamList, 'SetoranSummary'>;

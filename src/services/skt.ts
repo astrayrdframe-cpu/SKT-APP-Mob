@@ -32,6 +32,20 @@ export interface SetoranWorker {
   totalDefect: number; // "Bad"
   jamMasuk: string;
   jamKeluar: string;
+  // Which Tambah Setoran submission (per meja) this row belongs to — the
+  // Giling and Batil rows created by the same submission always share the
+  // same value (see buildSetoranWorkers in sktApi.ts). Used to pair a
+  // Giling row back up with its Batil row for the List Setoran card view
+  // (see pairSetoranByMeja in utils/mejaGrouping.ts). Undefined for rows
+  // that predate this field, or rows fetched from skt_view directly — no
+  // such column has shown up in that schema yet, so the pairing falls
+  // back to chronological order for those.
+  setoranKe?: number;
+  // How many Barcode Tray codes were scanned for this submission — from
+  // skt/test_temp for now (see resolveBarcodeTray), not a real master
+  // tray/batch table. Same availability caveat as setoranKe: undefined
+  // for skt_view rows, since there's no such column there either.
+  trayCount?: number;
 }
 
 // --- Setoran Summary screen types ---
@@ -85,4 +99,16 @@ export interface SetoranSummary {
 export interface BarcodeTrayRow {
   code: string;
   batang: number;
+}
+
+// One row from the skt/test_temp ORDS endpoint. A standalone test/demo
+// table — not tied to any SKT header/meja/pekerja — pulled in during the
+// Dashboard's "Get Data" resync and cached for later use.
+export interface TestTempRow {
+  id: number;
+  nameTest: string;
+  createdDate: string;
+  createdBy: string;
+  updatedDate: string | null;
+  updatedBy: string | null;
 }

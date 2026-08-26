@@ -7,18 +7,19 @@
 // modal presentation, reachable from the Scan button inside
 // TambahPekerjaModal.
 //
-// AbsensiScanScreen is imported lazily (React.lazy) rather than with a
-// normal top-level import. A plain `import AbsensiScanScreen from ...`
-// gets evaluated the instant this file loads — which means
-// react-native-vision-camera's native module gets touched as soon as the
-// navigator mounts, not only when the scanner is actually opened. If that
-// native dependency has any linking issue (wrong version installed,
-// missing pod/gradle setup, stale build, etc), a plain import can crash
-// the whole navigator — taking down every screen, including
+// AbsensiScanScreen and BarcodeTrayScanScreen are both imported lazily
+// (React.lazy) rather than with a normal top-level import. A plain
+// `import ... from ...` gets evaluated the instant this file loads —
+// which means react-native-vision-camera's native module gets touched as
+// soon as the navigator mounts, not only when a scanner is actually
+// opened. If that native dependency has any linking issue (wrong version
+// installed, missing pod/gradle setup, stale build, etc), a plain import
+// can crash the whole navigator — taking down every screen, including
 // SKTHeaderDetailScreen, which has nothing to do with the camera. Lazy
-// loading confines any camera-related crash to just the AbsensiScan route.
+// loading confines any camera-related crash to just the scan route that
+// triggered it.
 
-import React, { Suspense } from 'react';
+import React, { Suspense, useEffect } from 'react';
 import { View } from 'react-native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import HomeScreen from '../HomeScreen';
@@ -31,6 +32,7 @@ import { SKTHeaderItem } from '../../services/skt';
 import { MasterPekerja } from '../../services/pekerja';
 
 const AbsensiScanScreen = React.lazy(() => import('../page/absensi/AbsensiScanScreen'));
+const BarcodeTrayScanScreen = React.lazy(() => import('../page/setoran/BarcodeTrayScanScreen'));
 
 export type RootStackParamList = {
   InboundList: undefined;
@@ -57,11 +59,38 @@ export type RootStackParamList = {
         onCancelled?: () => void;
       }
     | undefined;
+  // Dedicated scanner for Tambah Setoran's "+ Scan to Add" (Barcode Tray)
+  // — separate from AbsensiScan since it verifies a scanned code against
+  // skt/test_temp, not skt_master_pekerja (see BarcodeTrayScanScreenCamera).
+  // onScannedCode fires once a scanned code is confirmed against test_temp
+  // and the admin taps "Gunakan"; onCancelled fires if the scanner closes
+  // any other way, same "always reopens the caller" contract as AbsensiScan.
+  BarcodeTrayScan:
+    | {
+        onScannedCode?: (code: string) => void;
+        onCancelled?: () => void;
+      }
+    | undefined;
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
 const MainNavigator = () => {
+  // Warm both scan screens' lazy chunks as soon as the navigator mounts —
+  // i.e. right after Metro finishes the initial bundle — instead of
+  // waiting for the first "Scan" tap inside Tambah Pekerja/Setoran.
+  // React.lazy's import() is a genuine async fetch to the Metro packager
+  // in dev (the "Downloading..." delay), and it's also the first touch of
+  // react-native-vision-camera's native module. Kicking it off here lets
+  // that happen in the background while the admin is still looking at the
+  // dashboard, so it's already resolved by the time any "Scan" button is
+  // tapped. Swallow the rejection — a real linking failure still surfaces
+  // normally via each wrapper screen's own try/catch when its route mounts.
+  useEffect(() => {
+    import('../page/absensi/AbsensiScanScreen').catch(() => {});
+    import('../page/setoran/BarcodeTrayScanScreen').catch(() => {});
+  }, []);
+
   return (
     <OfflineProvider>
       <Stack.Navigator
@@ -81,6 +110,18 @@ const MainNavigator = () => {
           {(props: any) => (
             <Suspense fallback={<View style={{ flex: 1, backgroundColor: '#0B0F1A' }} />}>
               <AbsensiScanScreen {...props} />
+            </Suspense>
+          )}
+        </Stack.Screen>
+        <Stack.Screen
+          name="BarcodeTrayScan"
+          options={{
+            presentation: 'fullScreenModal',
+            contentStyle: { backgroundColor: '#0B0F1A' },
+          }}>
+          {(props: any) => (
+            <Suspense fallback={<View style={{ flex: 1, backgroundColor: '#0B0F1A' }} />}>
+              <BarcodeTrayScanScreen {...props} />
             </Suspense>
           )}
         </Stack.Screen>

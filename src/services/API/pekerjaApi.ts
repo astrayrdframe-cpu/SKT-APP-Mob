@@ -1,4 +1,4 @@
-import { MasterPekerja } from '../pekerja';
+import { buildDetailPekerja, MasterPekerja } from '../pekerja';
 
 const SKT_MASTER_PEKERJA_ENDPOINT =
   'http://apps.nti-skt.net:8080/ords/sktntidev/skt/skt_master_pekerja';
@@ -71,6 +71,7 @@ export async function fetchMasterPekerja(
         nomorAbsen: row.nomor_absen,
         nik: row.nik,
         namaPekerja: row.nama_pekerja,
+        detailPekerja: buildDetailPekerja(row.nomor_absen, row.nama_pekerja, row.nik),
         active: row.active === 1,
         isTraining: row.is_training === 1,
         brakId: row.skt_master_brak_id,
@@ -99,6 +100,7 @@ export async function findMasterPekerjaByNik(nik: string): Promise<MasterPekerja
     nomorAbsen: match.nomor_absen,
     nik: match.nik,
     namaPekerja: match.nama_pekerja,
+    detailPekerja: buildDetailPekerja(match.nomor_absen, match.nama_pekerja, match.nik),
     active: match.active === 1,
     isTraining: match.is_training === 1,
     brakId: match.skt_master_brak_id,

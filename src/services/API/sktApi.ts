@@ -1,10 +1,13 @@
-import { SKTHeaderItem, SKTDetail, SetoranWorker, SetoranSummary, MejaSummary, PekerjaPair, PekerjaSlot, SetoranEntry, BarcodeTrayRow } from '../skt';
+import { SKTHeaderItem, SKTDetail, SetoranWorker, SetoranSummary, MejaSummary, PekerjaPair, PekerjaSlot, SetoranEntry, BarcodeTrayRow, TestTempRow } from '../skt';
 
 const SKT_HEADER_ENDPOINT =
   'http://apps.nti-skt.net:8080/ords/sktntidev/skt/skt_header';
 
 const SKT_VIEW_ENDPOINT =
   'http://apps.nti-skt.net:8080/ords/sktntidev/skt/skt_view';
+
+const SKT_TEST_TEMP_ENDPOINT =
+  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/test_temp';
 
 interface RawOrdsResponse {
   items: Record<string, any>[];
@@ -148,20 +151,14 @@ export async function fetchSktHeaderList(): Promise<SKTHeaderItem[]> {
  * skt_header_id are the actual "List Setoran" data — 5 worker rows per
  * meja (kode_setoran "1"/"2"/"3"/"A"/"B"), not mock data anymore.
  */
-export async function fetchSktDetail(
-  id: string | number
-): Promise<{ detail: SKTDetail; workers: SetoranWorker[] }> {
-  const [headerRows, viewRows] = await Promise.all([
-    fetchAllOrdsRows(SKT_HEADER_ENDPOINT) as Promise<RawHeaderRow[]>,
-    fetchAllOrdsRows(SKT_VIEW_ENDPOINT) as Promise<RawViewRow[]>,
-  ]);
-
-  const header = headerRows.find((h) => String(h.id) === String(id));
-  const relatedRows = viewRows.filter((v) => String(v.skt_header_id) === String(id));
-
-  if (!header) {
-    throw new Error(`No skt_header record found for id=${id}`);
-  }
+// Shared by fetchSktDetail (one id) and fetchAllSktDetails (every header in
+// one pass) so both build the exact same detail/worker shape off the same
+// two ORDS endpoints instead of duplicating the mapping logic.
+function buildDetailAndWorkers(
+  header: RawHeaderRow,
+  viewRows: RawViewRow[]
+): { detail: SKTDetail; workers: SetoranWorker[] } {
+  const relatedRows = viewRows.filter((v) => v.skt_header_id === header.id);
 
   const jumlahMeja = relatedRows[0]?.jumlah_meja ?? 0;
   const totalSetoran = relatedRows.reduce((sum, row) => sum + (row.total_setoran ?? 0), 0);
@@ -199,6 +196,99 @@ export async function fetchSktDetail(
   );
 
   return { detail, workers };
+}
+
+export async function fetchSktDetail(
+  id: string | number
+): Promise<{ detail: SKTDetail; workers: SetoranWorker[] }> {
+  const [headerRows, viewRows] = await Promise.all([
+    fetchAllOrdsRows(SKT_HEADER_ENDPOINT) as Promise<RawHeaderRow[]>,
+    fetchAllOrdsRows(SKT_VIEW_ENDPOINT) as Promise<RawViewRow[]>,
+  ]);
+
+  const header = headerRows.find((h) => String(h.id) === String(id));
+  if (!header) {
+    throw new Error(`No skt_header record found for id=${id}`);
+  }
+
+  return buildDetailAndWorkers(header, viewRows);
+}
+
+/**
+ * Full resync of every header's detail + worker list in one round trip —
+ * fetches skt_header and skt_view once, then builds each header's detail
+ * the same way fetchSktDetail does. Used by the Dashboard's "Get Data"
+ * confirmation (SinkronisasiDataModal) to refresh every cached detail
+ * record from ORDS, not just the summary list — the per-screen GET that
+ * SKTHeaderDetailScreen's loadDetail leaves commented out (see the note
+ * there) is effectively done here instead, for every record at once.
+ */
+export async function fetchAllSktDetails(): Promise<
+  Array<{ detail: SKTDetail; workers: SetoranWorker[] }>
+> {
+  const [headerRows, viewRows] = await Promise.all([
+    fetchAllOrdsRows(SKT_HEADER_ENDPOINT) as Promise<RawHeaderRow[]>,
+    fetchAllOrdsRows(SKT_VIEW_ENDPOINT) as Promise<RawViewRow[]>,
+  ]);
+
+  return headerRows.map((header) => buildDetailAndWorkers(header, viewRows));
+}
+
+interface RawTestTempRow {
+  id: number;
+  name_test: string;
+  created_date: string;
+  created_by: string;
+  updated_date: string | null;
+  updated_by: string | null;
+}
+
+function toTestTempRow(row: RawTestTempRow): TestTempRow {
+  return {
+    id: row.id,
+    nameTest: row.name_test,
+    createdDate: row.created_date,
+    createdBy: row.created_by,
+    updatedDate: row.updated_date,
+    updatedBy: row.updated_by,
+  };
+}
+
+/**
+ * skt/test_temp — a standalone test table, unrelated to any SKT
+ * header/meja/pekerja data. Pulled in alongside fetchAllSktDetails during
+ * the Dashboard's "Get Data" resync and cached as-is for later use.
+ */
+export async function fetchTestTempData(): Promise<TestTempRow[]> {
+  const rows = (await fetchAllOrdsRows(SKT_TEST_TEMP_ENDPOINT)) as RawTestTempRow[];
+  return rows.map(toTestTempRow);
+}
+
+/**
+ * Looks up one scanned "Barcode Tray" code against skt/test_temp — used by
+ * BarcodeTrayScanScreen (its own dedicated scanner, separate from
+ * AbsensiScanScreenCamera's Pekerja Giling/Batil scan) to verify a scanned
+ * code the same way AbsensiScanScreenCamera verifies a scanned NIK against
+ * skt_master_pekerja (see findMasterPekerjaByNik in pekerjaApi.ts).
+ *
+ * There's no real master tray/batch table yet (see resolveBarcodeTray
+ * below, which still only resolves a batang quantity once a code is
+ * already known-good), so test_temp — a standalone test table — stands in
+ * as the thing a scanned code gets checked against for now: a match on
+ * `name_test` (case/whitespace-insensitive), or its numeric `id` as a
+ * fallback, counts as "recognized". Swap this for a real tray/batch
+ * lookup once that table exists.
+ */
+export async function findTestTempRowByCode(code: string): Promise<TestTempRow | null> {
+  const rows = (await fetchAllOrdsRows(SKT_TEST_TEMP_ENDPOINT)) as RawTestTempRow[];
+  const normalized = code.trim().toLowerCase();
+
+  const match = rows.find(
+    (row) =>
+      (row.name_test ?? '').trim().toLowerCase() === normalized || String(row.id) === code.trim()
+  );
+
+  return match ? toTestTempRow(match) : null;
 }
 
 const GILING_CODES = new Set(['1', '2', '3']);
@@ -472,7 +562,11 @@ export const USE_LOCAL_SETORAN_CACHE = true;
 // ASSUMPTION: a scanned tray barcode resolves against some master
 // tray/batch table keyed by its printed code — no such table has shown up
 // in the schema yet, so this is a placeholder contract (code in, batang
-// count out).
+// count out). Note this only runs for a code that's already been verified
+// against skt/test_temp inside BarcodeTrayScanScreen (see
+// findTestTempRowByCode above) — that's the "compare against the API"
+// step; this one just figures out the batang quantity for a code already
+// known-good.
 const SKT_BARCODE_TRAY_RESOLVE_ENDPOINT =
   'http://apps.nti-skt.net:8080/ords/sktntidev/skt/TODO_REPLACE_ME_BARCODE_TRAY';
 
@@ -559,6 +653,12 @@ function buildSetoranWorkers(payload: SubmitSetoranPayload, idBase: number): Set
       totalDefect: payload.badWaste,
       jamMasuk: now,
       jamKeluar: '',
+      // Both rows below share the same setoranKe/trayCount — they're the
+      // two halves of one submission (see the SetoranWorker field comments
+      // in skt.ts, and pairSetoranByMeja in utils/mejaGrouping.ts which
+      // pairs them back up for the List Setoran card view).
+      setoranKe: payload.setoranKe,
+      trayCount: payload.barcodeTrays.length,
     },
     {
       id: idBase - 1,
@@ -571,6 +671,8 @@ function buildSetoranWorkers(payload: SubmitSetoranPayload, idBase: number): Set
       totalDefect: payload.badWaste,
       jamMasuk: now,
       jamKeluar: '',
+      setoranKe: payload.setoranKe,
+      trayCount: payload.barcodeTrays.length,
     },
   ];
 }
@@ -617,6 +719,10 @@ async function submitSetoranRemote(payload: SubmitSetoranPayload): Promise<Setor
         totalDefect: row.total_defect ?? 0,
         jamMasuk: row.jam_masuk ?? new Date().toISOString(),
         jamKeluar: row.jam_keluar ?? '',
+        // Same ASSUMPTION as the rest of this branch — no confirmed echo
+        // shape yet, so fall back to what was actually submitted.
+        setoranKe: row.setoran_ke ?? payload.setoranKe,
+        trayCount: row.tray_count ?? payload.barcodeTrays.length,
       })
     );
   }

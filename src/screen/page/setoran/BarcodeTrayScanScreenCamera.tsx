@@ -1,22 +1,36 @@
+// Dedicated camera scanner for Tambah Setoran's "+ Scan to Add" (Barcode
+// Tray) — a separate screen from AbsensiScanScreenCamera (which handles
+// Pekerja Giling/Batil badge scans against skt_master_pekerja). This one
+// scans a tray barcode and verifies it against skt/test_temp
+// (SKT_TEST_TEMP_ENDPOINT) instead — a standalone test table used as a
+// stand-in until a real master tray/batch table exists (see
+// findTestTempRowByCode in sktApi.ts). Kept as its own screen/route rather
+// than another mode on AbsensiScanScreenCamera since it verifies against a
+// completely different data source, not a variant of the pekerja lookup.
+//
+// Split into this "Camera" file plus a thin BarcodeTrayScanScreen.tsx
+// wrapper for the same reason AbsensiScanScreenCamera is — see that
+// wrapper's own comment: this file is the one that touches
+// react-native-vision-camera at the top level, so it's require()'d inside
+// a try/catch rather than statically imported, keeping a bad camera
+// install from crashing the whole navigator.
 import React, { useCallback, useRef, useState } from 'react';
 import { View, Text, TouchableOpacity, ActivityIndicator, StyleSheet, Linking } from 'react-native';
 import { useNavigation, useRoute, useIsFocused, RouteProp } from '@react-navigation/native';
 import { useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
 import { CodeScanner, Barcode } from 'react-native-vision-camera-barcode-scanner';
 import type { RootStackParamList } from '../../navigation/mainNavigation';
-import { findMasterPekerjaByNik } from '../../../services/API/pekerjaApi';
-import { extractNikFromScan, MasterPekerja } from '../../../services/pekerja';
+import { findTestTempRowByCode } from '../../../services/API/sktApi';
+import { TestTempRow } from '../../../services/skt';
 
 type ScanState = 'no-permission' | 'no-device' | 'idle' | 'verifying' | 'success' | 'not-found';
 
-type AbsensiScanRouteProp = RouteProp<RootStackParamList, 'AbsensiScan'>;
+type BarcodeTrayScanRouteProp = RouteProp<RootStackParamList, 'BarcodeTrayScan'>;
 
-// CodeScanner throws synchronously in its render if no camera device is
-// found (e.g. an emulator without a camera configured, or a brief timing
-// gap before the OS finishes enumerating devices). A plain try/catch can't
-// catch a render-time throw from a child component — only a class-based
-// error boundary can — so this turns that crash into a normal state update
-// instead of a red error screen.
+// Same reasoning as AbsensiScanScreenCamera's identical class — CodeScanner
+// throws synchronously in its render if no camera device is found, and
+// only a class-based error boundary can catch a render-time throw from a
+// child component.
 class CodeScannerErrorBoundary extends React.Component<
   { children: React.ReactNode; onDeviceUnavailable: () => void },
   { hasError: boolean }
@@ -37,48 +51,34 @@ class CodeScannerErrorBoundary extends React.Component<
   }
 }
 
-export default function AbsensiScanScreen() {
+export default function BarcodeTrayScanScreen() {
   const navigation = useNavigation();
-  const route = useRoute<AbsensiScanRouteProp>();
+  const route = useRoute<BarcodeTrayScanRouteProp>();
   const isFocused = useIsFocused();
-  const mode = route.params?.mode ?? 'pekerja';
-  const onScanned = route.params?.onScanned;
   const onScannedCode = route.params?.onScannedCode;
   const onCancelled = route.params?.onCancelled;
-  const isBarcodeMode = mode === 'barcode';
 
   const { hasPermission, requestPermission } = useCameraPermission();
 
-  // Reactive, not polled — react-native-vision-camera resolves its device
-  // factory asynchronously (native enumeration) and this hook re-renders on
-  // its own the moment that finishes, whether that takes 100ms or 3s. That
-  // replaces an earlier fixed `setTimeout` "settle delay" before mounting
-  // <CodeScanner>, which guessed 500ms was always enough — on a cold start
-  // (first scanner open in the session, right after the permission prompt,
-  // while CameraX/the HAL is still initializing) enumeration can genuinely
-  // take longer than that, so <CodeScanner> mounted too early, threw "No
-  // Camera device available!", and always showed "Kamera Tidak Ditemukan"
-  // on the very first open even with permission already granted. Later
-  // opens in the same session were fine because the factory promise was
-  // already resolved and cached by then.
+  // See AbsensiScanScreenCamera's identical `device` comment — reactive,
+  // not a guessed fixed delay, so the very first open of this screen in a
+  // session doesn't wrongly show "Kamera Tidak Ditemukan" while the
+  // camera factory is still resolving.
   const device = useCameraDevice('back');
 
   const [scanState, setScanState] = useState<ScanState>(hasPermission ? 'idle' : 'no-permission');
-  const [scannedNik, setScannedNik] = useState<string | null>(null);
-  const [matchedPekerja, setMatchedPekerja] = useState<MasterPekerja | null>(null);
+  const [scannedCode, setScannedCode] = useState<string | null>(null);
+  const [matchedTestTemp, setMatchedTestTemp] = useState<TestTempRow | null>(null);
 
   // Bumped on every "Coba Lagi" tap to force CodeScannerErrorBoundary to
-  // fully remount (its own `hasError` state never resets on its own, so
-  // without this, retrying after one failure would do nothing forever) and
-  // to restart the no-device grace timer below.
+  // fully remount and to restart the no-device grace timer below.
   const [retryKey, setRetryKey] = useState(0);
 
   // Set right before a successful "Gunakan" — lets the beforeRemove
-  // listener below tell the difference between "left because of a
-  // completed scan" (already handled via onScanned) and "left some other
-  // way" (X button, hardware back, swipe-back gesture — none of which were
-  // reopening TambahPekerjaModal before, silently dropping the admin back
-  // onto the bare Detail Meja screen instead of resuming where they left off).
+  // listener below tell "left because of a completed scan" (already
+  // handled via onScannedCode) apart from "left some other way" (X
+  // button, hardware back, swipe-back), so TambahSetoranModal reliably
+  // reopens no matter how the scan ends.
   const resolvedRef = useRef(false);
 
   React.useEffect(() => {
@@ -103,11 +103,9 @@ export default function AbsensiScanScreen() {
     });
   }, [hasPermission, requestPermission]);
 
-  // Genuine "no camera" fallback (e.g. an AVD emulator with no camera
-  // configured) — if `device` is still unresolved after a generous grace
-  // period, stop waiting and show the real error state instead of leaving
-  // the admin staring at a spinner forever. Restarts on every "Coba Lagi"
-  // via retryKey.
+  // Genuine "no camera" fallback — if `device` is still unresolved after a
+  // generous grace period, stop waiting and show the real error state.
+  // Restarts on every "Coba Lagi" via retryKey.
   React.useEffect(() => {
     if (!hasPermission || device != null) return;
     const timer = setTimeout(() => {
@@ -116,38 +114,27 @@ export default function AbsensiScanScreen() {
     return () => clearTimeout(timer);
   }, [hasPermission, device, retryKey]);
 
-  const handleScannedNik = useCallback(async (rawValue: string) => {
-    // Badges now encode "nomor_absen - nama_pekerja - nik" (detail_pekerja),
-    // not a bare NIK — pull just the NIK back out before looking it up.
-    // Older badges with no " - " separator pass through unchanged.
-    const nik = extractNikFromScan(rawValue);
-    setScannedNik(nik);
+  // Verify the scanned code against skt/test_temp — a match on `name_test`
+  // (or `id` as a fallback) counts as "recognized"; anything else is
+  // rejected. See findTestTempRowByCode in sktApi.ts for the matching
+  // rule and why test_temp stands in for a real tray/batch table.
+  const handleScannedCode = useCallback(async (code: string) => {
+    setScannedCode(code);
     setScanState('verifying');
 
     try {
-      const pekerja = await findMasterPekerjaByNik(nik);
-      if (pekerja) {
-        setMatchedPekerja(pekerja);
+      const match = await findTestTempRowByCode(code);
+      if (match) {
+        setMatchedTestTemp(match);
         setScanState('success');
       } else {
-        setMatchedPekerja(null);
+        setMatchedTestTemp(null);
         setScanState('not-found');
       }
     } catch {
-      setMatchedPekerja(null);
+      setMatchedTestTemp(null);
       setScanState('not-found');
     }
-  }, []);
-
-  // Barcode-tray mode has nothing to verify a code against (no master
-  // tray/batch table exists yet — see resolveBarcodeTray in sktApi.ts) —
-  // any nonempty code read off the camera is accepted immediately, and
-  // the caller (TambahSetoranModal) resolves it to a batang quantity
-  // after it navigates back.
-  const handleScannedBarcode = useCallback((code: string) => {
-    setScannedNik(code);
-    setMatchedPekerja(null);
-    setScanState('success');
   }, []);
 
   const handleBarcodeScanned = (barcodes: Barcode[]) => {
@@ -156,29 +143,20 @@ export default function AbsensiScanScreen() {
     if (!value) return;
 
     isProcessingRef.current = true;
-    if (isBarcodeMode) {
-      handleScannedBarcode(value);
-    } else {
-      handleScannedNik(value);
-    }
+    handleScannedCode(value);
   };
 
   const resetToIdle = () => {
     isProcessingRef.current = false;
-    setScannedNik(null);
-    setMatchedPekerja(null);
+    setScannedCode(null);
+    setMatchedTestTemp(null);
     setScanState('idle');
   };
 
   const handleGunakan = () => {
-    if (isBarcodeMode) {
-      if (scannedNik) {
-        resolvedRef.current = true;
-        onScannedCode?.(scannedNik);
-      }
-    } else if (matchedPekerja) {
+    if (scannedCode && matchedTestTemp) {
       resolvedRef.current = true;
-      onScanned?.(matchedPekerja);
+      onScannedCode?.(scannedCode);
     }
     navigation.goBack();
   };
@@ -195,17 +173,14 @@ export default function AbsensiScanScreen() {
         <TouchableOpacity onPress={() => navigation.goBack()} accessibilityLabel="Close scanner">
           <Text style={styles.closeIcon}>✕</Text>
         </TouchableOpacity>
-        <Text style={styles.topBarTitle}>{isBarcodeMode ? 'Scan Barcode Tray' : 'Scan Absensi'}</Text>
+        <Text style={styles.topBarTitle}>Scan Barcode Tray</Text>
         <View style={{ width: 20 }} />
       </View>
 
-      {/* Camera + built-in MLKit code scanner — only mounted once permission
-          is confirmed AND `useCameraDevice` has actually resolved a device,
-          rather than after a guessed fixed delay (see the `device` comment
-          above for why that used to fail on the first open). key={retryKey}
-          forces a full remount (and a fresh error boundary) every time
-          "Coba Lagi" is tapped. The error boundary stays as a safety net
-          for any other synchronous throw from CodeScanner. */}
+      {/* Camera + built-in MLKit code scanner — see AbsensiScanScreenCamera's
+          identical comment for why mounting waits on both `hasPermission`
+          and a resolved `device`, and why key={retryKey} forces a full
+          remount (fresh error boundary) on every "Coba Lagi". */}
       <View style={styles.cameraArea}>
         {hasPermission && device != null ? (
           <CodeScannerErrorBoundary
@@ -232,9 +207,7 @@ export default function AbsensiScanScreen() {
         </View>
 
         {isCameraActive && device != null && (
-          <Text style={styles.cameraHint}>
-            {isBarcodeMode ? 'Arahkan kamera ke barcode tray' : 'Arahkan kamera ke barcode pekerja'}
-          </Text>
+          <Text style={styles.cameraHint}>Arahkan kamera ke barcode tray</Text>
         )}
       </View>
 
@@ -283,45 +256,24 @@ export default function AbsensiScanScreen() {
         )}
 
         {scanState === 'idle' && device != null && (
-          <Text style={styles.idleText}>
-            {isBarcodeMode ? 'Menunggu barcode tray...' : 'Menunggu barcode...'}
-          </Text>
+          <Text style={styles.idleText}>Menunggu barcode tray...</Text>
         )}
 
         {scanState === 'verifying' && (
           <View style={styles.centeredRow}>
             <ActivityIndicator color="#2F5FD1" />
-            <Text style={styles.verifyingText}>Memverifikasi NIK {scannedNik}...</Text>
+            <Text style={styles.verifyingText}>Memverifikasi barcode {scannedCode}...</Text>
           </View>
         )}
 
-        {scanState === 'success' && isBarcodeMode && scannedNik && (
+        {scanState === 'success' && scannedCode && matchedTestTemp && (
           <View>
             <View style={styles.successIconCircle}>
               <Text style={styles.successIconText}>✓</Text>
             </View>
-            <Text style={styles.successTitle}>Barcode Terdeteksi</Text>
-            <Text style={styles.workerName}>{scannedNik}</Text>
-            <TouchableOpacity
-              style={[styles.primaryButton, styles.fullWidthButton]}
-              onPress={handleGunakan}
-              activeOpacity={0.85}
-            >
-              <Text style={styles.primaryButtonText}>Gunakan</Text>
-            </TouchableOpacity>
-          </View>
-        )}
-
-        {scanState === 'success' && !isBarcodeMode && matchedPekerja && (
-          <View>
-            <View style={styles.successIconCircle}>
-              <Text style={styles.successIconText}>✓</Text>
-            </View>
-            <Text style={styles.successTitle}>Pekerja Ditemukan</Text>
-            <Text style={styles.workerName}>{matchedPekerja.namaPekerja}</Text>
-            <Text style={styles.workerMeta}>
-              NIK {matchedPekerja.nik} · {matchedPekerja.nomorAbsen}
-            </Text>
+            <Text style={styles.successTitle}>Barcode Ditemukan</Text>
+            <Text style={styles.workerName}>{scannedCode}</Text>
+            <Text style={styles.workerMeta}>Cocok dengan "{matchedTestTemp.nameTest}"</Text>
             <TouchableOpacity
               style={[styles.primaryButton, styles.fullWidthButton]}
               onPress={handleGunakan}
@@ -337,9 +289,9 @@ export default function AbsensiScanScreen() {
             <View style={styles.errorIconCircle}>
               <Text style={styles.errorIconText}>✕</Text>
             </View>
-            <Text style={styles.errorTitle}>NIK Tidak Ditemukan</Text>
+            <Text style={styles.errorTitle}>Barcode Tidak Dikenali</Text>
             <Text style={styles.errorSubtitle}>
-              NIK {scannedNik} belum terdaftar. Coba scan ulang atau hubungi admin.
+              Barcode {scannedCode} tidak ditemukan di data. Coba scan ulang atau hubungi admin.
             </Text>
             <TouchableOpacity style={styles.primaryButton} onPress={resetToIdle} activeOpacity={0.85}>
               <Text style={styles.primaryButtonText}>Coba Lagi</Text>
@@ -463,7 +415,6 @@ const styles = StyleSheet.create({
     marginBottom: 16,
     paddingHorizontal: 8,
   },
-  buttonRow: { flexDirection: 'row', gap: 10, justifyContent: 'center' },
   primaryButton: {
     backgroundColor: '#2F5FD1',
     borderRadius: 24,
