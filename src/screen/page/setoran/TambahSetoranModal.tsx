@@ -17,6 +17,7 @@ import {
   Modal,
   View,
   Text,
+  TextInput,
   TouchableOpacity,
   ScrollView,
   ActivityIndicator,
@@ -24,10 +25,38 @@ import {
   BackHandler,
   StyleSheet,
 } from 'react-native';
-import { MasterPekerja, MejaGroup } from '../../../services/pekerja';
-import { BarcodeTrayRow } from '../../../services/skt';
+import { MasterPekerja, MejaGroup, PekerjaRow } from '../../../services/pekerja';
+import { BarcodeTrayRow, SetoranWorker } from '../../../services/skt';
 import { resolveBarcodeTray, SubmitSetoranPayload } from '../../../services/API/sktApi';
 import { isNumericCode } from '../../../utils/pekerjaRole';
+import { computePairSetoranKe } from '../../../utils/mejaGrouping';
+
+// Reshapes a meja roster row into the MasterPekerja shape giling/batil
+// state expects — same idea as SKTHeaderDetailScreen's workerToPekerjaStub,
+// but for a manually-picked-from-the-roster seat instead of an existing
+// setoran row. `id` here is the seat's skt_log_pekerja_id, not a
+// skt_master_pekerja.id — fine, since a manual pick is submitted the same
+// way a scan result is (masterPekerjaId is carried through as-is either
+// way, see handleSubmit's payload below). active/isTraining/brakId have no
+// equivalent on PekerjaRow, filled with harmless defaults to satisfy the
+// type.
+function pekerjaRowToMasterPekerja(p: PekerjaRow): MasterPekerja {
+  return {
+    id: p.id,
+    nomorAbsen: p.nomorAbsen,
+    nik: p.nik,
+    namaPekerja: p.namaPekerja,
+    detailPekerja: p.detailPekerja,
+    active: true,
+    isTraining: false,
+    brakId: 0,
+  };
+}
+
+// A roster seat tagged with which meja it belongs to — what `allPekerja`
+// (and therefore gilingCandidates/batilCandidates) below is built from,
+// once every meja's roster is flattened into a single header-wide pool.
+type PekerjaWithMeja = PekerjaRow & { nomorMeja: number };
 
 interface TambahSetoranModalProps {
   visible: boolean;
@@ -36,30 +65,63 @@ interface TambahSetoranModalProps {
   brand: string;
   jenisLabel: string;
   brakLabel: string; // e.g. "Djinggo"
-  nomorMeja: number;
-  // When the parent screen's own meja tab is "Semua Meja" there's no single
-  // meja this setoran unambiguously belongs to, so the caller passes every
-  // valid meja number here and the "Meja" field renders as a picker instead
-  // of the plain read-only box. Omitted (or a single-item list) keeps the
-  // old read-only behaviour — e.g. when a specific "Meja N" tab is active.
-  mejaOptions?: number[];
-  onChangeMeja?: (nomorMeja: number) => void;
-  // Every meja's roster (who's seated where, and as which kode) — a scan
-  // is only accepted for Pekerja Giling/Batil if the scanned pekerja
-  // (identified by `detailPekerja`, not NIK alone) is actually seated at
-  // `nomorMeja`, and only in the matching role (numeric kode = Giling,
-  // alpha kode = Batil). Scanning is otherwise wide open to the whole
-  // master pekerja directory, which would let anyone from any meja (or the
-  // wrong role at this meja) get logged against this setoran.
+  // Which meja this setoran belongs to. In edit mode this is the pair's
+  // fixed, immutable meja (re-scanning/re-picking is disabled — see
+  // isEditing below). For a fresh add it's null: there is no meja to show
+  // yet, since Pekerja Giling/Batil are now picked from every worker on
+  // this SKT header (see mejaGroups below), not from one pre-chosen meja's
+  // roster — the meja is only known, and the "Meja" field only populated,
+  // once the admin actually picks (or scans) a Giling or Batil. See
+  // `resolvedMeja` below for where that derived value lives.
+  nomorMeja: number | null;
+  // Every meja's roster (who's seated where, and as which kode) for this
+  // whole SKT header — this is now the FULL candidate pool for Pekerja
+  // Giling/Batil (both the manual "Pilih Pekerja" dropdowns and a scan),
+  // not just whichever meja happens to be active elsewhere on screen. A
+  // pick is only accepted in the role its own seat holds there (numeric
+  // kode = Giling, alpha kode = Batil), and — once the OTHER side is
+  // already picked — only if it's seated at that same meja (a setoran's
+  // Giling and Batil must come from one meja, see the cross-meja checks
+  // below).
   mejaGroups: MejaGroup[];
-  setoranKe: number;
+  // Provisional "Setoran ke" used as-is in edit mode, where the pair can't
+  // change (re-scanning is disabled — see isEditing below) so the original
+  // number is simply kept. Null for a fresh add: like nomorMeja above,
+  // there's nothing real to show until both Giling and Batil are picked
+  // and their shared meja is known (see computePairSetoranKe below).
+  setoranKe: number | null;
+  // Every existing setoran row (all meja, not just `nomorMeja`) — used to
+  // recompute the real, pair-scoped "Setoran ke" (see computePairSetoranKe
+  // in utils/mejaGrouping.ts) live as soon as both Giling and Batil are
+  // picked in the add flow. Not consulted in edit mode.
+  workers: SetoranWorker[];
   isSubmitting?: boolean;
   onSubmit: (payload: SubmitSetoranPayload) => void;
   // Edit-mode hook: pass the two existing skt_log_pekerja ids to show
-  // Hapus. No entry point wires this up yet (List Setoran rows aren't
-  // tappable for edit), but the dialog is ready for it.
+  // Hapus, and (see initialGiling/initialBatil/initialBarcodeTrays/
+  // initialBadWaste below) to pre-fill the rest of the form. Wired up from
+  // SKTHeaderDetailScreen's handleEditSetoran, triggered by tapping a List
+  // Setoran card.
   existingSetoranId?: { gilingId: number; batilId: number } | null;
   onDelete?: () => void;
+  // Edit-mode pre-fill — the giling/batil already on this submission,
+  // its already-scanned tray rows, and its current Bad/Waste count.
+  // Consumed once, as each field's useState initial value (see the "no
+  // reset on `visible`" note below for why this can't be a plain effect) —
+  // the parent bumps `key` to remount this component for both a fresh
+  // "+ Tambah Setoran" AND an edit open, so these are only ever read at
+  // mount. Omitted (or left undefined) for the ordinary add flow.
+  initialGiling?: MasterPekerja | null;
+  initialBatil?: MasterPekerja | null;
+  // The exact seat kode ("1"/"2"/"3" for Giling, "A"/"B" for Batil) each
+  // side actually held on the original submission — carried alongside
+  // initialGiling/initialBatil so editing (where re-scanning is disabled)
+  // still submits the pair's real kode instead of losing track of it.
+  // Not rendered anywhere — see the same field on SetoranWorker in skt.ts.
+  initialGilingKode?: string | null;
+  initialBatilKode?: string | null;
+  initialBarcodeTrays?: BarcodeTrayRow[];
+  initialBadWaste?: number;
   onPressScanGiling: () => void;
   onPressScanBatil: () => void;
   onPressScanTray: () => void;
@@ -83,14 +145,19 @@ export default function TambahSetoranModal({
   jenisLabel,
   brakLabel,
   nomorMeja,
-  mejaOptions,
-  onChangeMeja,
   mejaGroups,
   setoranKe,
+  workers,
   isSubmitting = false,
   onSubmit,
   existingSetoranId = null,
   onDelete,
+  initialGiling = null,
+  initialBatil = null,
+  initialGilingKode = null,
+  initialBatilKode = null,
+  initialBarcodeTrays = [],
+  initialBadWaste = 0,
   onPressScanGiling,
   onPressScanBatil,
   onPressScanTray,
@@ -99,12 +166,50 @@ export default function TambahSetoranModal({
   scannedTrayCode,
   scannedTrayToken,
 }: TambahSetoranModalProps) {
-  const [giling, setGiling] = useState<MasterPekerja | null>(null);
-  const [batil, setBatil] = useState<MasterPekerja | null>(null);
-  const [barcodeTrays, setBarcodeTrays] = useState<BarcodeTrayRow[]>([]);
-  const [badWaste, setBadWaste] = useState(0);
+  const isEditing = !!existingSetoranId;
+
+  const [giling, setGiling] = useState<MasterPekerja | null>(initialGiling);
+  const [batil, setBatil] = useState<MasterPekerja | null>(initialBatil);
+  // The specific seat kode each side resolved to — set alongside
+  // giling/batil whenever a scan validates (see the scannedGiling/
+  // scannedBatil effects below), since the same MasterPekerja can hold
+  // different kode at different meja (or even two kode at the SAME meja,
+  // dual-role) — kode isn't intrinsic to the pekerja, only to this scan.
+  const [gilingKode, setGilingKode] = useState<string | null>(initialGilingKode);
+  const [batilKode, setBatilKode] = useState<string | null>(initialBatilKode);
+  // The "Pilih Pekerja" search box text for each side — mirrors
+  // TambahPekerjaModal's searchQuery, but there's no separate Kode Pekerja
+  // step here: which list a name is picked from (gilingCandidates vs
+  // batilCandidates below) already fixes the role. Kept in sync with
+  // giling/batil (set together on a scan, a manual pick, or a meja change)
+  // so the box always reflects whoever's actually selected right now.
+  const [gilingQuery, setGilingQuery] = useState(initialGiling?.namaPekerja ?? '');
+  const [batilQuery, setBatilQuery] = useState(initialBatil?.namaPekerja ?? '');
+  const [isGilingDropdownOpen, setIsGilingDropdownOpen] = useState(false);
+  const [isBatilDropdownOpen, setIsBatilDropdownOpen] = useState(false);
+  const [barcodeTrays, setBarcodeTrays] = useState<BarcodeTrayRow[]>(initialBarcodeTrays);
+  const [badWaste, setBadWaste] = useState(initialBadWaste);
   const [isResolvingTray, setIsResolvingTray] = useState(false);
-  const [isMejaDropdownOpen, setIsMejaDropdownOpen] = useState(false);
+  // The meja a fresh add's pick(s) resolved to — null (nothing to show yet)
+  // until a Giling or Batil is actually picked (manually or via scan). Once
+  // one side sets this, the other side is validated against it (see the
+  // scannedGiling/scannedBatil effects and handleSelectGiling/Batil below)
+  // instead of being free to come from anywhere. Seeded from `nomorMeja` for
+  // edit mode, where it's fixed and never changes.
+  const [resolvedMeja, setResolvedMeja] = useState<number | null>(nomorMeja);
+
+  // The real "Setoran ke" for THIS pair, recomputed live once both Giling
+  // and Batil (and therefore `resolvedMeja`) are picked (see
+  // computePairSetoranKe in utils/mejaGrouping.ts — it's scoped to this
+  // exact two-person pair, not the whole meja). Null (nothing to show) until
+  // then, and never recomputed in edit mode — re-scanning is disabled
+  // there, so the pair (and therefore its number) can't change; the
+  // original `setoranKe` is kept as-is.
+  const displaySetoranKe = useMemo<number | null>(() => {
+    if (isEditing) return setoranKe;
+    if (!giling || !batil || resolvedMeja === null) return null;
+    return computePairSetoranKe(workers, resolvedMeja, giling, batil);
+  }, [isEditing, giling, batil, resolvedMeja, workers, setoranKe]);
 
   // Rendered in-tree instead of Alert.alert — same reasoning as
   // TambahPekerjaModal's errorMessage overlay: this dialog is its own
@@ -114,14 +219,50 @@ export default function TambahSetoranModal({
   // in front.
   const [scanError, setScanError] = useState<{ title: string; message: string } | null>(null);
 
-  const isMejaSelectable = !!mejaOptions && mejaOptions.length > 1;
-
-  // The roster actually seated at the meja this setoran targets — recomputed
-  // whenever that changes (tab switch, or the "Meja" picker above).
-  const currentMejaPekerja = useMemo(
-    () => mejaGroups.find((g) => g.nomorMeja === nomorMeja)?.pekerja ?? [],
-    [mejaGroups, nomorMeja]
+  // Every meja's roster flattened into one list, each row tagged with the
+  // meja it's actually seated at — this (not any single meja's roster) is
+  // now the full candidate pool for both "Pilih Pekerja" dropdowns below.
+  // Picking a name no longer requires already knowing/choosing its meja
+  // first; the meja is discovered FROM the pick (see resolvedMeja above).
+  const allPekerja = useMemo(
+    () => mejaGroups.flatMap((g) => g.pekerja.map((p) => ({ ...p, nomorMeja: g.nomorMeja }))),
+    [mejaGroups]
   );
+
+  // Manual-pick candidates for each field — every seat on this header
+  // holding the matching role (numeric kode = Giling, alpha kode = Batil),
+  // filtered further by whatever's typed in that field's search box. This
+  // is the "don't need to pick any role" part of the manual flow: which
+  // list a name can even appear in already fixes it as Giling or Batil, so
+  // there's no separate Kode Pekerja step like Tambah Pekerja has. A
+  // dual-role pekerja (holding both a numeric and an alpha kode at the same
+  // meja) legitimately shows up in both lists.
+  //
+  // Meja-filtered ONLY once `resolvedMeja` is actually known — i.e. once
+  // the OTHER side has already been picked (or, in edit mode, always).
+  // Nothing's picked yet, both lists show every meja's candidates (that's
+  // the "everyone on this header" starting point); the moment one side
+  // locks in a meja, the other side's list narrows down to just that
+  // meja's seats — e.g. pick Jumroh as Giling at Meja 1, and the Batil list
+  // then only shows Meja 1's Batil-role seats, not every meja's.
+  const gilingCandidates = useMemo(() => {
+    const query = gilingQuery.trim().toLowerCase();
+    return allPekerja.filter(
+      (p) =>
+        isNumericCode(p.kode) &&
+        (resolvedMeja === null || p.nomorMeja === resolvedMeja) &&
+        (!query || p.namaPekerja.toLowerCase().includes(query))
+    );
+  }, [allPekerja, gilingQuery, resolvedMeja]);
+  const batilCandidates = useMemo(() => {
+    const query = batilQuery.trim().toLowerCase();
+    return allPekerja.filter(
+      (p) =>
+        !isNumericCode(p.kode) &&
+        (resolvedMeja === null || p.nomorMeja === resolvedMeja) &&
+        (!query || p.namaPekerja.toLowerCase().includes(query))
+    );
+  }, [allPekerja, batilQuery, resolvedMeja]);
 
   // NOTE: there's deliberately no "reset on `visible`" effect here anymore.
   // This component never actually unmounts between scans — hiding it just
@@ -136,78 +277,104 @@ export default function TambahSetoranModal({
   // SKTHeaderDetailScreen — which re-initializes every useState above for
   // free, without touching state across a scan's hide/reshow round trip.
 
-  // A giling/batil pick is only valid for one specific meja (its kode is
-  // registered there, not anywhere else) — if the admin changes meja after
-  // already scanning someone, that pick no longer means anything and has
-  // to be re-scanned.
-  useEffect(() => {
-    setGiling(null);
-    setBatil(null);
-  }, [nomorMeja]);
-
   // Pick up a freshly scanned giling pekerja handed back from AbsensiScan.
-  // Only accepted if they're actually seated at this meja AND hold the
-  // Giling (numeric) kode there — anyone else is rejected outright. Note
-  // there's deliberately no "already picked as Batil" guard here: a pekerja
-  // can hold BOTH a Giling and a Batil kode at the same meja (see
-  // TambahPekerjaModal's dual-role rule), so the same pekerja legitimately
-  // filling both slots in one setoran is the correct outcome, not an error
-  // — the seat check below (via `.some()` across every row matching this
-  // pekerja's `detailPekerja`, not just the first match) is what actually
-  // decides eligibility.
+  // Only accepted if they're actually seated SOMEWHERE on this header AND
+  // hold the Giling (numeric) kode there — anyone else is rejected
+  // outright. Note there's deliberately no "already picked as Batil" guard
+  // here: a pekerja can hold BOTH a Giling and a Batil kode at the same
+  // meja (see TambahPekerjaModal's dual-role rule), so the same pekerja
+  // legitimately filling both slots in one setoran is the correct outcome,
+  // not an error — the seat check below (via `.filter()` across every row
+  // matching this pekerja's `detailPekerja`, not just the first match) is
+  // what actually decides eligibility. If Batil is already picked, this
+  // scan additionally has to land on that SAME meja — a setoran's pair
+  // can't span two different meja (cross-meja check).
   useEffect(() => {
     if (!scannedGiling) return;
-    const seatsForPekerja = currentMejaPekerja.filter(
+    const seatsForPekerja = allPekerja.filter(
       (p) => p.detailPekerja === scannedGiling.detailPekerja
     );
     if (seatsForPekerja.length === 0) {
       setScanError({
         title: 'Tidak Bisa Digunakan',
-        message: `${scannedGiling.namaPekerja} tidak terdaftar di Meja ${nomorMeja}.`,
+        message: `${scannedGiling.namaPekerja} tidak terdaftar di meja manapun.`,
       });
       return;
     }
-    if (!seatsForPekerja.some((p) => isNumericCode(p.kode))) {
+    const gilingSeat = seatsForPekerja.find((p) => isNumericCode(p.kode));
+    if (!gilingSeat) {
       setScanError({
         title: 'Tidak Bisa Digunakan',
-        message: `${scannedGiling.namaPekerja} terdaftar sebagai Batil di Meja ${nomorMeja}, bukan Giling.`,
+        message: `${scannedGiling.namaPekerja} terdaftar sebagai Batil di Meja ${seatsForPekerja[0].nomorMeja}, bukan Giling.`,
+      });
+      return;
+    }
+    if (resolvedMeja !== null && gilingSeat.nomorMeja !== resolvedMeja) {
+      setScanError({
+        title: 'Tidak Bisa Digunakan',
+        message: `${scannedGiling.namaPekerja} terdaftar di Meja ${gilingSeat.nomorMeja}, sedangkan Batil yang sudah dipilih ada di Meja ${resolvedMeja}. Giling dan Batil harus berasal dari meja yang sama.`,
       });
       return;
     }
     setGiling(scannedGiling);
+    // The actual seat kode ("1"/"2"/"3") this scan resolved to — see
+    // SetoranPekerjaInput.kode in sktApi.ts for why this matters (a
+    // hardcoded '1' would silently mislabel anyone not in the first seat).
+    setGilingKode(gilingSeat.kode);
+    // Keeps the manual "Pilih Pekerja" box in sync with a scan result too
+    // — same field either way, so a scan should look exactly like picking
+    // that name from the list.
+    setGilingQuery(scannedGiling.namaPekerja);
+    setIsGilingDropdownOpen(false);
+    // Now known: this is the meja the whole setoran belongs to (see
+    // resolvedMeja above) — populates the Meja/Setoran ke fields.
+    setResolvedMeja(gilingSeat.nomorMeja);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scannedGiling]);
 
   // Pick up a freshly scanned batil pekerja handed back from AbsensiScan.
-  // Only accepted if they're actually seated at this meja AND hold the
-  // Batil (alpha) kode there — anyone else is rejected outright. Same
-  // dual-role reasoning as the Giling effect above: no "already picked as
-  // Giling" guard, since the same pekerja can legitimately fill both slots.
-  // groupWorkersByMeja sorts Giling (numeric) rows first, so a naive
+  // Only accepted if they're actually seated SOMEWHERE on this header AND
+  // hold the Batil (alpha) kode there — anyone else is rejected outright.
+  // Same dual-role reasoning as the Giling effect above: no "already picked
+  // as Giling" guard, since the same pekerja can legitimately fill both
+  // slots. groupWorkersByMeja sorts Giling (numeric) rows first, so a naive
   // `.find()` here would always land on their Giling row and wrongly
-  // reject a dual-role pekerja's Batil scan — `.some()` across every row
+  // reject a dual-role pekerja's Batil scan — `.filter()` across every row
   // matching this pekerja's `detailPekerja` is what makes the check
-  // correct.
+  // correct. Same cross-meja check as the Giling effect above once Giling
+  // is already picked.
   useEffect(() => {
     if (!scannedBatil) return;
-    const seatsForPekerja = currentMejaPekerja.filter(
+    const seatsForPekerja = allPekerja.filter(
       (p) => p.detailPekerja === scannedBatil.detailPekerja
     );
     if (seatsForPekerja.length === 0) {
       setScanError({
         title: 'Tidak Bisa Digunakan',
-        message: `${scannedBatil.namaPekerja} tidak terdaftar di Meja ${nomorMeja}.`,
+        message: `${scannedBatil.namaPekerja} tidak terdaftar di meja manapun.`,
       });
       return;
     }
-    if (!seatsForPekerja.some((p) => !isNumericCode(p.kode))) {
+    const batilSeat = seatsForPekerja.find((p) => !isNumericCode(p.kode));
+    if (!batilSeat) {
       setScanError({
         title: 'Tidak Bisa Digunakan',
-        message: `${scannedBatil.namaPekerja} terdaftar sebagai Giling di Meja ${nomorMeja}, bukan Batil.`,
+        message: `${scannedBatil.namaPekerja} terdaftar sebagai Giling di Meja ${seatsForPekerja[0].nomorMeja}, bukan Batil.`,
+      });
+      return;
+    }
+    if (resolvedMeja !== null && batilSeat.nomorMeja !== resolvedMeja) {
+      setScanError({
+        title: 'Tidak Bisa Digunakan',
+        message: `${scannedBatil.namaPekerja} terdaftar di Meja ${batilSeat.nomorMeja}, sedangkan Giling yang sudah dipilih ada di Meja ${resolvedMeja}. Giling dan Batil harus berasal dari meja yang sama.`,
       });
       return;
     }
     setBatil(scannedBatil);
+    setBatilKode(batilSeat.kode);
+    setBatilQuery(scannedBatil.namaPekerja);
+    setIsBatilDropdownOpen(false);
+    setResolvedMeja(batilSeat.nomorMeja);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scannedBatil]);
 
@@ -281,11 +448,81 @@ export default function TambahSetoranModal({
     setBarcodeTrays((prev) => prev.filter((t) => t.code !== code));
   };
 
+  // Manual alternative to the scan effects above. gilingCandidates/
+  // batilCandidates are already meja-filtered once `resolvedMeja` is known
+  // (see above), so in normal use `p` can only ever be from that same
+  // meja — the cross-meja check here is belt-and-suspenders, same spirit
+  // as the gilingKode/batilKode `!!` checks on canSubmit below, not an
+  // expected extra gate in practice.
+  const handleSelectGiling = (p: PekerjaWithMeja) => {
+    if (resolvedMeja !== null && p.nomorMeja !== resolvedMeja) {
+      setScanError({
+        title: 'Tidak Bisa Digunakan',
+        message: `${p.namaPekerja} terdaftar di Meja ${p.nomorMeja}, sedangkan Batil yang sudah dipilih ada di Meja ${resolvedMeja}. Giling dan Batil harus berasal dari meja yang sama.`,
+      });
+      return;
+    }
+    setGiling(pekerjaRowToMasterPekerja(p));
+    setGilingKode(p.kode);
+    setGilingQuery(p.namaPekerja);
+    setIsGilingDropdownOpen(false);
+    setResolvedMeja(p.nomorMeja);
+  };
+  const handleSelectBatil = (p: PekerjaWithMeja) => {
+    if (resolvedMeja !== null && p.nomorMeja !== resolvedMeja) {
+      setScanError({
+        title: 'Tidak Bisa Digunakan',
+        message: `${p.namaPekerja} terdaftar di Meja ${p.nomorMeja}, sedangkan Giling yang sudah dipilih ada di Meja ${resolvedMeja}. Giling dan Batil harus berasal dari meja yang sama.`,
+      });
+      return;
+    }
+    setBatil(pekerjaRowToMasterPekerja(p));
+    setBatilKode(p.kode);
+    setBatilQuery(p.namaPekerja);
+    setIsBatilDropdownOpen(false);
+    setResolvedMeja(p.nomorMeja);
+  };
+
+  // Typing clears whatever was picked (scanned or selected) — same rule as
+  // TambahPekerjaModal's search box: the old pick no longer matches what's
+  // in the box, so it has to be re-picked from the (now re-filtered) list.
+  // Also releases `resolvedMeja` back to unknown once NEITHER side is
+  // picked anymore — but only then: if the other side is still picked, its
+  // meja still stands and the cleared side just needs to be re-picked
+  // there.
+  const handleGilingQueryChange = (text: string) => {
+    setGilingQuery(text);
+    setGiling(null);
+    setGilingKode(null);
+    setIsGilingDropdownOpen(true);
+    if (!batil) setResolvedMeja(null);
+  };
+  const handleBatilQueryChange = (text: string) => {
+    setBatilQuery(text);
+    setBatil(null);
+    setBatilKode(null);
+    setIsBatilDropdownOpen(true);
+    if (!giling) setResolvedMeja(null);
+  };
+
   const totalBatang = barcodeTrays.reduce((sum, t) => sum + t.batang, 0);
-  const canSubmit = !!giling && !!batil && barcodeTrays.length > 0 && !isSubmitting;
+  // gilingKode/batilKode are always set in the same effect that sets
+  // giling/batil (see the scannedGiling/scannedBatil effects above, and
+  // initialGilingKode/initialBatilKode for edit mode) — the `!!` checks
+  // here are belt-and-suspenders, not an expected extra gate in practice.
+  // resolvedMeja is always set alongside them too (same effects/handlers),
+  // so its own check is the same kind of belt-and-suspenders.
+  const canSubmit =
+    !!giling &&
+    !!gilingKode &&
+    !!batil &&
+    !!batilKode &&
+    resolvedMeja !== null &&
+    barcodeTrays.length > 0 &&
+    !isSubmitting;
 
   const handleSubmit = () => {
-    if (!giling || !batil) return;
+    if (!giling || !gilingKode || !batil || !batilKode || resolvedMeja === null) return;
     // Belt-and-suspenders alongside canSubmit disabling the button below —
     // every setoran must carry at least one Nomor Tray, so this can never
     // go through with an empty barcodeTrays list.
@@ -298,19 +535,26 @@ export default function TambahSetoranModal({
     }
     onSubmit({
       sktHeaderId,
-      nomorMeja,
-      setoranKe,
+      nomorMeja: resolvedMeja,
+      // displaySetoranKe is only ever null when giling/batil/resolvedMeja
+      // aren't all set yet (see its useMemo above) — canSubmit already
+      // guards on exactly that, so it's guaranteed a real number here.
+      setoranKe: displaySetoranKe as number,
       giling: {
         masterPekerjaId: giling.id,
         nik: giling.nik,
         namaPekerja: giling.namaPekerja,
         nomorAbsen: giling.nomorAbsen,
+        kode: gilingKode,
+        role: 'giling',
       },
       batil: {
         masterPekerjaId: batil.id,
         nik: batil.nik,
         namaPekerja: batil.namaPekerja,
         nomorAbsen: batil.nomorAbsen,
+        kode: batilKode,
+        role: 'batil',
       },
       barcodeTrays,
       badWaste,
@@ -332,7 +576,7 @@ export default function TambahSetoranModal({
           <TouchableOpacity onPress={onClose} accessibilityLabel="Go back">
             <Text style={styles.backIcon}>←</Text>
           </TouchableOpacity>
-          <Text style={styles.topBarTitle}>Tambah Setoran</Text>
+          <Text style={styles.topBarTitle}>{isEditing ? 'Edit Setoran' : 'Tambah Setoran'}</Text>
           <View style={{ width: 20 }} />
         </View>
 
@@ -362,74 +606,128 @@ export default function TambahSetoranModal({
             )}
           </View>
 
+          {/* Pekerja Giling — scan OR pick manually from gilingCandidates
+              (every Giling-role seat on this whole header, no separate role
+              step like Tambah Pekerja's Kode Pekerja — see gilingCandidates
+              above). Re-picking/re-scanning would swap the worker on an
+              already-saved submission, so both are disabled in edit mode
+              rather than removed (keeps the row's layout/labels consistent
+              with the add flow). */}
           <Text style={[styles.fieldLabel, styles.fieldSpacing]}>Pekerja Giling</Text>
-          <View style={styles.pekerjaRow}>
-            <Text style={styles.pekerjaName} numberOfLines={1}>
-              {giling ? giling.namaPekerja : 'Belum discan'}
-            </Text>
-            <TouchableOpacity style={styles.scanButton} onPress={onPressScanGiling} activeOpacity={0.8}>
+          <View style={styles.pilihPekerjaBox}>
+            <TextInput
+              style={styles.searchInput}
+              value={gilingQuery}
+              onChangeText={handleGilingQueryChange}
+              onFocus={() => setIsGilingDropdownOpen(true)}
+              placeholder="Cari atau pilih pekerja giling..."
+              placeholderTextColor="#98A2B3"
+              editable={!isEditing}
+            />
+            <TouchableOpacity
+              style={[styles.scanButton, isEditing && styles.scanButtonDisabled]}
+              onPress={onPressScanGiling}
+              activeOpacity={0.8}
+              disabled={isEditing}
+            >
               <Text style={styles.scanButtonText}>📷 Scan</Text>
             </TouchableOpacity>
           </View>
+          {isGilingDropdownOpen && !isEditing && (
+            <View style={styles.dropdown}>
+              {gilingCandidates.length === 0 ? (
+                <Text style={styles.dropdownEmptyText}>
+                  {resolvedMeja !== null
+                    ? `Tidak ada Pekerja Giling di Meja ${resolvedMeja}`
+                    : 'Tidak ada Pekerja Giling ditemukan'}
+                </Text>
+              ) : (
+                gilingCandidates.map((p) => (
+                  <TouchableOpacity
+                    key={p.id}
+                    style={styles.dropdownItem}
+                    onPress={() => handleSelectGiling(p)}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.dropdownItemName} numberOfLines={1}>
+                      {p.namaPekerja}
+                    </Text>
+                    {/* Meja shown up front here — with candidates no longer
+                        filtered to one meja, this is what lets the admin
+                        actually tell apart, say, two "Andi"s seated at
+                        different tables before picking one. */}
+                    <Text style={styles.dropdownItemNik}>
+                      {p.nik} · Meja {p.nomorMeja}
+                    </Text>
+                  </TouchableOpacity>
+                ))
+              )}
+            </View>
+          )}
 
           <Text style={[styles.fieldLabel, styles.fieldSpacing]}>Pekerja Batil</Text>
-          <View style={styles.pekerjaRow}>
-            <Text style={styles.pekerjaName} numberOfLines={1}>
-              {batil ? batil.namaPekerja : 'Belum discan'}
-            </Text>
-            <TouchableOpacity style={styles.scanButton} onPress={onPressScanBatil} activeOpacity={0.8}>
+          <View style={styles.pilihPekerjaBox}>
+            <TextInput
+              style={styles.searchInput}
+              value={batilQuery}
+              onChangeText={handleBatilQueryChange}
+              onFocus={() => setIsBatilDropdownOpen(true)}
+              placeholder="Cari atau pilih pekerja batil..."
+              placeholderTextColor="#98A2B3"
+              editable={!isEditing}
+            />
+            <TouchableOpacity
+              style={[styles.scanButton, isEditing && styles.scanButtonDisabled]}
+              onPress={onPressScanBatil}
+              activeOpacity={0.8}
+              disabled={isEditing}
+            >
               <Text style={styles.scanButtonText}>📷 Scan</Text>
             </TouchableOpacity>
           </View>
+          {isBatilDropdownOpen && !isEditing && (
+            <View style={styles.dropdown}>
+              {batilCandidates.length === 0 ? (
+                <Text style={styles.dropdownEmptyText}>
+                  {resolvedMeja !== null
+                    ? `Tidak ada Pekerja Batil di Meja ${resolvedMeja}`
+                    : 'Tidak ada Pekerja Batil ditemukan'}
+                </Text>
+              ) : (
+                batilCandidates.map((p) => (
+                  <TouchableOpacity
+                    key={p.id}
+                    style={styles.dropdownItem}
+                    onPress={() => handleSelectBatil(p)}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.dropdownItemName} numberOfLines={1}>
+                      {p.namaPekerja}
+                    </Text>
+                    <Text style={styles.dropdownItemNik}>
+                      {p.nik} · Meja {p.nomorMeja}
+                    </Text>
+                  </TouchableOpacity>
+                ))
+              )}
+            </View>
+          )}
 
+          {/* Meja/Setoran ke are no longer admin-chosen — both are purely
+              derived from whichever Giling/Batil ends up picked above (see
+              resolvedMeja/displaySetoranKe), so they render as plain
+              read-only boxes, blank ("—") until that happens. */}
           <View style={[styles.twoCol, styles.fieldSpacing]}>
             <View style={styles.twoColItem}>
               <Text style={styles.fieldLabel}>Meja</Text>
-              {isMejaSelectable ? (
-                <>
-                  <TouchableOpacity
-                    style={styles.mejaPickerBox}
-                    onPress={() => setIsMejaDropdownOpen((open) => !open)}
-                    activeOpacity={0.8}
-                  >
-                    <Text style={styles.readonlyValue}>{nomorMeja}</Text>
-                    <Text style={styles.mejaPickerChevron}>{isMejaDropdownOpen ? '⌃' : '⌄'}</Text>
-                  </TouchableOpacity>
-                  {isMejaDropdownOpen && (
-                    <View style={styles.mejaDropdown}>
-                      {mejaOptions!.map((meja) => (
-                        <TouchableOpacity
-                          key={meja}
-                          style={styles.mejaDropdownItem}
-                          onPress={() => {
-                            onChangeMeja?.(meja);
-                            setIsMejaDropdownOpen(false);
-                          }}
-                          activeOpacity={0.7}
-                        >
-                          <Text
-                            style={[
-                              styles.mejaDropdownItemText,
-                              meja === nomorMeja && styles.mejaDropdownItemTextActive,
-                            ]}
-                          >
-                            Meja {meja}
-                          </Text>
-                        </TouchableOpacity>
-                      ))}
-                    </View>
-                  )}
-                </>
-              ) : (
-                <View style={styles.readonlyBox}>
-                  <Text style={styles.readonlyValue}>{nomorMeja}</Text>
-                </View>
-              )}
+              <View style={styles.readonlyBox}>
+                <Text style={styles.readonlyValue}>{resolvedMeja ?? '—'}</Text>
+              </View>
             </View>
             <View style={styles.twoColItem}>
               <Text style={styles.fieldLabel}>Setoran ke</Text>
               <View style={styles.readonlyBox}>
-                <Text style={styles.readonlyValue}>{setoranKe}</Text>
+                <Text style={styles.readonlyValue}>{displaySetoranKe ?? '—'}</Text>
               </View>
             </View>
           </View>
@@ -515,7 +813,7 @@ export default function TambahSetoranModal({
             {isSubmitting ? (
               <ActivityIndicator size="small" color="#FFFFFF" />
             ) : (
-              <Text style={styles.submitButtonText}>Submit</Text>
+              <Text style={styles.submitButtonText}>{isEditing ? 'Simpan' : 'Submit'}</Text>
             )}
           </TouchableOpacity>
         </View>
@@ -636,20 +934,46 @@ const styles = StyleSheet.create({
 
   fieldLabel: { fontSize: 12, fontWeight: '700', color: '#101828' },
   fieldSpacing: { marginTop: 20, marginBottom: 8 },
-  pekerjaRow: {
+  // "Pilih Pekerja" box for Pekerja Giling/Batil — same shape as
+  // TambahPekerjaModal's pilihPekerjaBox (search input + inline Scan
+  // button), just with "Scan" instead of "⌕ Scan" since this one still
+  // needs to stay visually distinct as the camera-scan trigger, not a
+  // dropdown-open toggle.
+  pilihPekerjaBox: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
     gap: 8,
     marginTop: 8,
     backgroundColor: '#FFFFFF',
     borderWidth: 1,
     borderColor: '#EEF1F5',
     borderRadius: 10,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
+    paddingVertical: 6,
+    paddingLeft: 12,
+    paddingRight: 6,
   },
-  pekerjaName: { flex: 1, fontSize: 12, fontWeight: '700', color: '#101828', letterSpacing: 0.2 },
+  searchInput: { flex: 1, fontSize: 12, fontWeight: '700', color: '#101828', paddingVertical: 4 },
+  dropdown: {
+    marginTop: 4,
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#D0D5DD',
+    borderRadius: 10,
+    maxHeight: 176,
+    overflow: 'hidden',
+  },
+  dropdownItem: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F2F4F7',
+  },
+  dropdownItemName: { fontSize: 12, fontWeight: '600', color: '#101828', flex: 1, marginRight: 8 },
+  dropdownItemNik: { fontSize: 11, color: '#98A2B3' },
+  dropdownEmptyText: { fontSize: 11, color: '#98A2B3', padding: 12, textAlign: 'center' },
   scanButton: {
     flexShrink: 0,
     flexDirection: 'row',
@@ -661,6 +985,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
   },
   scanButtonText: { color: '#FFFFFF', fontSize: 11, fontWeight: '700' },
+  scanButtonDisabled: { backgroundColor: '#B0C4EF' },
 
   twoCol: { flexDirection: 'row', gap: 12 },
   twoColItem: { flex: 1 },
@@ -672,35 +997,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
   },
   readonlyValue: { fontSize: 15, fontWeight: '700', color: '#101828' },
-  mejaPickerBox: {
-    marginTop: 8,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: '#FFFFFF',
-    borderWidth: 1,
-    borderColor: '#D0D5DD',
-    borderRadius: 10,
-    paddingVertical: 11,
-    paddingHorizontal: 12,
-  },
-  mejaPickerChevron: { fontSize: 12, color: '#667085' },
-  mejaDropdown: {
-    marginTop: 4,
-    backgroundColor: '#FFFFFF',
-    borderWidth: 1,
-    borderColor: '#D0D5DD',
-    borderRadius: 10,
-    overflow: 'hidden',
-  },
-  mejaDropdownItem: {
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#F2F4F7',
-  },
-  mejaDropdownItemText: { fontSize: 13, fontWeight: '600', color: '#344054' },
-  mejaDropdownItemTextActive: { color: '#2F5FD1' },
 
   sectionHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   scanToAddButton: {

@@ -1,4 +1,6 @@
 import { SKTHeaderItem, SKTDetail, SetoranWorker, SetoranSummary, MejaSummary, PekerjaPair, PekerjaSlot, SetoranEntry, BarcodeTrayRow, TestTempRow } from '../skt';
+import { loadFromCache, CACHE_KEYS } from '../Offline/persistence';
+import { dedupeById } from '../../utils/dedupe';
 
 const SKT_HEADER_ENDPOINT =
   'http://apps.nti-skt.net:8080/ords/sktntidev/skt/skt_header';
@@ -68,6 +70,22 @@ interface RawViewRow {
   jam_keluar: string;
 }
 
+// Dedup-aware wrappers around fetchAllOrdsRows for skt_header/skt_view —
+// every caller below (fetchSktHeaderList, fetchSktDetail,
+// fetchAllSktDetails, fetchSetoranSummary) goes through these instead of
+// fetchAllOrdsRows directly, so a duplicate row from ORDS (a dirty
+// view/join, or a pagination overlap) gets dropped once, right at the
+// fetch boundary, rather than needing to be filtered again by every caller.
+async function fetchSktHeaderRows(): Promise<RawHeaderRow[]> {
+  const rows = (await fetchAllOrdsRows(SKT_HEADER_ENDPOINT)) as RawHeaderRow[];
+  return dedupeById(rows, (r) => r.id);
+}
+
+async function fetchSktViewRows(): Promise<RawViewRow[]> {
+  const rows = (await fetchAllOrdsRows(SKT_VIEW_ENDPOINT)) as RawViewRow[];
+  return dedupeById(rows, (r) => r.skt_log_pekerja_id);
+}
+
 function deriveJenisLabel(jenisGarapanId: string, jumlahGarapanLembur: number): string {
   // ASSUMPTION: "2" (or any non-"1" code) plus a nonzero lembur count
   // means overtime ("Lembur"); "1" is the regular ("Biasa") shift.
@@ -124,8 +142,8 @@ function injectDualRoleTestRow(workers: SetoranWorker[]): SetoranWorker[] {
  */
 export async function fetchSktHeaderList(): Promise<SKTHeaderItem[]> {
   const [headerRows, viewRows] = await Promise.all([
-    fetchAllOrdsRows(SKT_HEADER_ENDPOINT) as Promise<RawHeaderRow[]>,
-    fetchAllOrdsRows(SKT_VIEW_ENDPOINT) as Promise<RawViewRow[]>,
+    fetchSktHeaderRows(),
+    fetchSktViewRows(),
   ]);
 
   return headerRows.map((header): SKTHeaderItem => {
@@ -202,8 +220,8 @@ export async function fetchSktDetail(
   id: string | number
 ): Promise<{ detail: SKTDetail; workers: SetoranWorker[] }> {
   const [headerRows, viewRows] = await Promise.all([
-    fetchAllOrdsRows(SKT_HEADER_ENDPOINT) as Promise<RawHeaderRow[]>,
-    fetchAllOrdsRows(SKT_VIEW_ENDPOINT) as Promise<RawViewRow[]>,
+    fetchSktHeaderRows(),
+    fetchSktViewRows(),
   ]);
 
   const header = headerRows.find((h) => String(h.id) === String(id));
@@ -227,8 +245,8 @@ export async function fetchAllSktDetails(): Promise<
   Array<{ detail: SKTDetail; workers: SetoranWorker[] }>
 > {
   const [headerRows, viewRows] = await Promise.all([
-    fetchAllOrdsRows(SKT_HEADER_ENDPOINT) as Promise<RawHeaderRow[]>,
-    fetchAllOrdsRows(SKT_VIEW_ENDPOINT) as Promise<RawViewRow[]>,
+    fetchSktHeaderRows(),
+    fetchSktViewRows(),
   ]);
 
   return headerRows.map((header) => buildDetailAndWorkers(header, viewRows));
@@ -260,7 +278,10 @@ function toTestTempRow(row: RawTestTempRow): TestTempRow {
  * the Dashboard's "Get Data" resync and cached as-is for later use.
  */
 export async function fetchTestTempData(): Promise<TestTempRow[]> {
-  const rows = (await fetchAllOrdsRows(SKT_TEST_TEMP_ENDPOINT)) as RawTestTempRow[];
+  const rows = dedupeById(
+    (await fetchAllOrdsRows(SKT_TEST_TEMP_ENDPOINT)) as RawTestTempRow[],
+    (r) => r.id
+  );
   return rows.map(toTestTempRow);
 }
 
@@ -269,26 +290,33 @@ export async function fetchTestTempData(): Promise<TestTempRow[]> {
  * BarcodeTrayScanScreen (its own dedicated scanner, separate from
  * AbsensiScanScreenCamera's Pekerja Giling/Batil scan) to verify a scanned
  * code the same way AbsensiScanScreenCamera verifies a scanned NIK against
- * skt_master_pekerja (see findMasterPekerjaByNik in pekerjaApi.ts).
+ * skt_master_pekerja (see findMasterPekerjaByNik in pekerjaApi.ts — same
+ * cache-only approach, same reasoning).
+ *
+ * Reads CACHE_KEYS.TEST_TEMP instead of hitting ORDS live — same "no
+ * direct GET from a feature screen" rule the rest of the app follows (see
+ * loadDetail's disabled GET in SKTHeaderDetailScreen.tsx). That cache is
+ * populated by fetchTestTempData() during the Dashboard's "Get Data" sync
+ * (see syncAllFromOrds in SKTHeaderDashboardScreen.tsx), so a scan works
+ * fully offline between syncs.
  *
  * There's no real master tray/batch table yet (see resolveBarcodeTray
  * below, which still only resolves a batang quantity once a code is
  * already known-good), so test_temp — a standalone test table — stands in
  * as the thing a scanned code gets checked against for now: a match on
- * `name_test` (case/whitespace-insensitive), or its numeric `id` as a
+ * `nameTest` (case/whitespace-insensitive), or its numeric `id` as a
  * fallback, counts as "recognized". Swap this for a real tray/batch
  * lookup once that table exists.
  */
 export async function findTestTempRowByCode(code: string): Promise<TestTempRow | null> {
-  const rows = (await fetchAllOrdsRows(SKT_TEST_TEMP_ENDPOINT)) as RawTestTempRow[];
+  const rows = (await loadFromCache<TestTempRow[]>(CACHE_KEYS.TEST_TEMP)) ?? [];
   const normalized = code.trim().toLowerCase();
 
   const match = rows.find(
-    (row) =>
-      (row.name_test ?? '').trim().toLowerCase() === normalized || String(row.id) === code.trim()
+    (row) => row.nameTest.trim().toLowerCase() === normalized || String(row.id) === code.trim()
   );
 
-  return match ? toTestTempRow(match) : null;
+  return match ?? null;
 }
 
 const GILING_CODES = new Set(['1', '2', '3']);
@@ -327,7 +355,7 @@ function toSlot(rows: RawViewRow[]): PekerjaSlot {
  * pair will show 1-2 rows rather than the 4-row example in the mockup.
  */
 export async function fetchSetoranSummary(id: number): Promise<SetoranSummary> {
-  const viewRows = (await fetchAllOrdsRows(SKT_VIEW_ENDPOINT)) as RawViewRow[];
+  const viewRows = await fetchSktViewRows();
   const relatedRows = viewRows.filter((v) => v.skt_header_id === id);
 
   const mejaNumbers = Array.from(new Set(relatedRows.map((r) => r.nomor_meja))).sort(
@@ -578,6 +606,10 @@ const SKT_LOG_SETORAN_ADD_ENDPOINT =
 const SKT_LOG_SETORAN_DELETE_ENDPOINT =
   'http://apps.nti-skt.net:8080/ords/sktntidev/skt/TODO_REPLACE_ME_SETORAN_DELETE';
 
+// TODO: replace with the real POST/PUT endpoint once confirmed with the backend team.
+const SKT_LOG_SETORAN_UPDATE_ENDPOINT =
+  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/TODO_REPLACE_ME_SETORAN_UPDATE';
+
 /**
  * TEMPLATE — real lookup for one scanned tray barcode. Returns the batang
  * (stem) count that barcode represents so the admin never types a
@@ -619,6 +651,17 @@ interface SetoranPekerjaInput {
   nik: string;
   namaPekerja: string;
   nomorAbsen: string;
+  // The exact seat kode ("1"/"2"/"3"/"A"/"B") this pekerja actually holds
+  // at the target meja, read off their roster seat at scan time (see
+  // TambahSetoranModal's scannedGiling/scannedBatil effects) — not
+  // hardcoded to a fixed first-seat guess. Carried all the way through to
+  // the persisted SetoranWorker row (see buildSetoranWorkers below) and,
+  // once USE_LOCAL_SETORAN_CACHE is off, out in the real POST body.
+  kode: string;
+  // Which side of the pair this input represents. Redundant with `kode`
+  // (derivable via isGilingCode) but kept explicit so the POST body/report
+  // doesn't need to re-derive it — not surfaced anywhere in the UI.
+  role: 'giling' | 'batil';
 }
 
 export interface SubmitSetoranPayload {
@@ -631,20 +674,36 @@ export interface SubmitSetoranPayload {
   badWaste: number; // "Bad"
 }
 
-// ASSUMPTION: first free giling/batil seat codes — confirm the real
-// seat-assignment rule with the backend team once available (see the
-// same assumption already called out on TambahPekerjaModal's ALL_CODES).
-const GILING_KODE_SETORAN = '1';
-const BATIL_KODE_SETORAN = 'A';
+// Unique id shared by both rows of one submission (see
+// SetoranWorker.transactionId in skt.ts) — good enough for local-cache
+// uniqueness; swap for whatever the real backend mints (a DB
+// sequence/UUID) once the real ORDS endpoint exists.
+function generateTransactionId(): string {
+  return `TXN-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`.toUpperCase();
+}
 
-function buildSetoranWorkers(payload: SubmitSetoranPayload, idBase: number): SetoranWorker[] {
+// `ids` default to a fresh negative-id pair, and `transactionId` to a
+// freshly minted one — the shape every brand-new Tambah Setoran submission
+// gets. `kodeSetoran`/`role` always come straight off `payload.giling`/
+// `payload.batil` (the actual seat the admin scanned — see
+// SetoranPekerjaInput above), never a hardcoded guess. Editing an existing
+// submission (see updateSetoran below) passes the original
+// skt_log_pekerja_id/transactionId for each side instead of fresh ones, so
+// the update rewrites the same two rows in place rather than minting new
+// ones.
+function buildSetoranWorkers(
+  payload: SubmitSetoranPayload,
+  ids: { giling: number; batil: number } = { giling: -Date.now(), batil: -Date.now() - 1 },
+  transactionId: string = generateTransactionId()
+): SetoranWorker[] {
   const totalGood = payload.barcodeTrays.reduce((sum, t) => sum + t.batang, 0);
   const now = new Date().toISOString();
 
   return [
     {
-      id: idBase,
-      kodeSetoran: GILING_KODE_SETORAN,
+      id: ids.giling,
+      kodeSetoran: payload.giling.kode,
+      role: payload.giling.role,
       namaPekerja: payload.giling.namaPekerja,
       nomorAbsen: payload.giling.nomorAbsen,
       nik: payload.giling.nik,
@@ -653,16 +712,20 @@ function buildSetoranWorkers(payload: SubmitSetoranPayload, idBase: number): Set
       totalDefect: payload.badWaste,
       jamMasuk: now,
       jamKeluar: '',
-      // Both rows below share the same setoranKe/trayCount — they're the
-      // two halves of one submission (see the SetoranWorker field comments
-      // in skt.ts, and pairSetoranByMeja in utils/mejaGrouping.ts which
-      // pairs them back up for the List Setoran card view).
+      // Both rows below share the same setoranKe/transactionId/trayCount/
+      // barcodeTrays — they're the two halves of one submission (see the
+      // SetoranWorker field comments in skt.ts, and pairSetoranByMeja in
+      // utils/mejaGrouping.ts which pairs them back up for the List
+      // Setoran card view).
       setoranKe: payload.setoranKe,
+      transactionId,
       trayCount: payload.barcodeTrays.length,
+      barcodeTrays: payload.barcodeTrays,
     },
     {
-      id: idBase - 1,
-      kodeSetoran: BATIL_KODE_SETORAN,
+      id: ids.batil,
+      kodeSetoran: payload.batil.kode,
+      role: payload.batil.role,
       namaPekerja: payload.batil.namaPekerja,
       nomorAbsen: payload.batil.nomorAbsen,
       nik: payload.batil.nik,
@@ -672,7 +735,9 @@ function buildSetoranWorkers(payload: SubmitSetoranPayload, idBase: number): Set
       jamMasuk: now,
       jamKeluar: '',
       setoranKe: payload.setoranKe,
+      transactionId,
       trayCount: payload.barcodeTrays.length,
+      barcodeTrays: payload.barcodeTrays,
     },
   ];
 }
@@ -710,7 +775,12 @@ async function submitSetoranRemote(payload: SubmitSetoranPayload): Promise<Setor
     return data.items.map(
       (row: any, i: number): SetoranWorker => ({
         id: row.id ?? row.skt_log_pekerja_id,
-        kodeSetoran: row.kode_setoran ?? (i === 0 ? GILING_KODE_SETORAN : BATIL_KODE_SETORAN),
+        // Same ASSUMPTION as the rest of this branch — no confirmed echo
+        // shape yet, so fall back to what was actually submitted (the
+        // pekerja's real scanned seat, not a hardcoded guess — see
+        // SetoranPekerjaInput.kode/role above).
+        kodeSetoran: row.kode_setoran ?? (i === 0 ? payload.giling.kode : payload.batil.kode),
+        role: row.role ?? (i === 0 ? payload.giling.role : payload.batil.role),
         namaPekerja: row.nama_pekerja,
         nomorAbsen: row.nomor_absen,
         nik: row.nik,
@@ -719,15 +789,15 @@ async function submitSetoranRemote(payload: SubmitSetoranPayload): Promise<Setor
         totalDefect: row.total_defect ?? 0,
         jamMasuk: row.jam_masuk ?? new Date().toISOString(),
         jamKeluar: row.jam_keluar ?? '',
-        // Same ASSUMPTION as the rest of this branch — no confirmed echo
-        // shape yet, so fall back to what was actually submitted.
         setoranKe: row.setoran_ke ?? payload.setoranKe,
+        transactionId: row.transaction_id ?? generateTransactionId(),
         trayCount: row.tray_count ?? payload.barcodeTrays.length,
+        barcodeTrays: payload.barcodeTrays,
       })
     );
   }
 
-  return buildSetoranWorkers(payload, -Date.now());
+  return buildSetoranWorkers(payload);
 }
 
 /**
@@ -737,7 +807,7 @@ async function submitSetoranRemote(payload: SubmitSetoranPayload): Promise<Setor
  */
 async function submitSetoranLocalCache(payload: SubmitSetoranPayload): Promise<SetoranWorker[]> {
   await new Promise<void>((resolve) => setTimeout(resolve, 500));
-  return buildSetoranWorkers(payload, -Date.now());
+  return buildSetoranWorkers(payload);
 }
 
 /**
@@ -752,6 +822,115 @@ export async function submitSetoran(payload: SubmitSetoranPayload): Promise<Seto
     return submitSetoranLocalCache(payload);
   }
   return submitSetoranRemote(payload);
+}
+
+// ---------------------------------------------------------------------------
+// Tambah Setoran (edit mode) — update an existing submission's two rows
+// ---------------------------------------------------------------------------
+//
+// Same local-cache-for-testing / ORDS-ready split as submitSetoran above.
+// Reuses buildSetoranWorkers with the ORIGINAL skt_log_pekerja_id/kode_setoran
+// for each side (instead of minting fresh ones) so the two existing rows get
+// rewritten in place rather than duplicated.
+export interface UpdateSetoranPayload extends SubmitSetoranPayload {
+  gilingId: number; // existing skt_log_pekerja_id to update, not replace
+  batilId: number;
+  // Note: no separate gilingKode/batilKode here — the original seat's kode
+  // (and role) already travels through payload.giling.kode/payload.batil.kode
+  // (see SetoranPekerjaInput above), since re-scanning is disabled while
+  // editing (see TambahSetoranModal's isEditing), so those are always the
+  // pair's real, unchanged values.
+  //
+  // Preserve the submission's original transactionId across the edit —
+  // it's still the same real-world submission, just with edited fields, so
+  // a report/log tracing it shouldn't see it as a new transaction. Missing
+  // for rows that predate this field (see SetoranWorker.transactionId in
+  // skt.ts); a fresh one is minted for those, upgrading them going forward.
+  transactionId?: string;
+}
+
+/**
+ * TEMPLATE — real POST/PUT to overwrite an existing setoran submission's two
+ * rows (giling + batil). Body is snake_case to match a typical ORDS/PL/SQL
+ * module, same shape as submitSetoranRemote plus the two existing ids.
+ */
+async function updateSetoranRemote(payload: UpdateSetoranPayload): Promise<SetoranWorker[]> {
+  const response = await fetch(SKT_LOG_SETORAN_UPDATE_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      skt_header_id: payload.sktHeaderId,
+      nomor_meja: payload.nomorMeja,
+      setoran_ke: payload.setoranKe,
+      giling_id: payload.gilingId,
+      batil_id: payload.batilId,
+      giling: payload.giling,
+      batil: payload.batil,
+      barcode_trays: payload.barcodeTrays,
+      bad_waste: payload.badWaste,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Gagal menyimpan perubahan setoran (status ${response.status})`);
+  }
+
+  const data = await response.json();
+
+  // ASSUMPTION — unconfirmed: same echo-shape assumption as
+  // submitSetoranRemote. Falls back to rebuilding from what was submitted
+  // (with the original ids/kode/role/transactionId preserved) if the
+  // response doesn't match.
+  if (Array.isArray(data?.items) && data.items.length === 2) {
+    return data.items.map(
+      (row: any, i: number): SetoranWorker => ({
+        id: row.id ?? row.skt_log_pekerja_id ?? (i === 0 ? payload.gilingId : payload.batilId),
+        kodeSetoran: row.kode_setoran ?? (i === 0 ? payload.giling.kode : payload.batil.kode),
+        role: row.role ?? (i === 0 ? payload.giling.role : payload.batil.role),
+        namaPekerja: row.nama_pekerja,
+        nomorAbsen: row.nomor_absen,
+        nik: row.nik,
+        nomorMeja: payload.nomorMeja,
+        totalSetoran: row.total_setoran ?? 0,
+        totalDefect: row.total_defect ?? 0,
+        jamMasuk: row.jam_masuk ?? new Date().toISOString(),
+        jamKeluar: row.jam_keluar ?? '',
+        setoranKe: row.setoran_ke ?? payload.setoranKe,
+        transactionId: row.transaction_id ?? payload.transactionId ?? generateTransactionId(),
+        trayCount: row.tray_count ?? payload.barcodeTrays.length,
+        barcodeTrays: payload.barcodeTrays,
+      })
+    );
+  }
+
+  return buildSetoranWorkers(
+    payload,
+    { giling: payload.gilingId, batil: payload.batilId },
+    payload.transactionId ?? generateTransactionId()
+  );
+}
+
+/** Local-only update — rewrites the two existing rows, no network call. */
+async function updateSetoranLocalCache(payload: UpdateSetoranPayload): Promise<SetoranWorker[]> {
+  await new Promise<void>((resolve) => setTimeout(resolve, 400));
+  return buildSetoranWorkers(
+    payload,
+    { giling: payload.gilingId, batil: payload.batilId },
+    payload.transactionId ?? generateTransactionId()
+  );
+}
+
+/**
+ * Entry point Tambah Setoran's Submit button should call when editing an
+ * existing List Setoran row (see SKTHeaderDetailScreen's handleEditSetoran /
+ * handleSubmitEditSetoran). Routes to the local cache or the real ORDS call
+ * based on USE_LOCAL_SETORAN_CACHE, same as submitSetoran/deleteSetoran.
+ */
+export async function updateSetoran(payload: UpdateSetoranPayload): Promise<SetoranWorker[]> {
+  if (USE_LOCAL_SETORAN_CACHE) {
+    return updateSetoranLocalCache(payload);
+  }
+  return updateSetoranRemote(payload);
 }
 
 export interface DeleteSetoranPayload {
@@ -786,6 +965,16 @@ async function deleteSetoranLocalCache(_payload: DeleteSetoranPayload): Promise<
 /**
  * Entry point Tambah Setoran's Hapus button should call (edit-mode only —
  * see TambahSetoranModal's `existingSetoranId` prop).
+ *
+ * This only asks the backend to drop the SUBMISSION rows behind gilingId/
+ * batilId — it's never the right call for removing a pekerja's meja seat
+ * (that's deletePekerjaFromMeja above). SKTHeaderDetailScreen's
+ * handleDeleteSetoranPair enforces "delete the transaction, not the
+ * worker" on the local-cache side: if either id turns out to also be that
+ * person's only seat at this meja/role (a bare roster pairing that was
+ * never a real standalone submission), it's kept with its setoran fields
+ * reset rather than removed. A real backend endpoint implementing this
+ * POST should apply the same rule server-side.
  */
 export async function deleteSetoran(payload: DeleteSetoranPayload): Promise<void> {
   if (USE_LOCAL_SETORAN_CACHE) {

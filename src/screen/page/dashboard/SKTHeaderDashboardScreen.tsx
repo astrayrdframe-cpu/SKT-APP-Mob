@@ -14,7 +14,10 @@ import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import Icon from 'react-native-vector-icons/FontAwesome5';
 import { fetchSktHeaderList, fetchAllSktDetails, fetchTestTempData } from '../../../services/API/sktApi';
+import { fetchMasterPekerja } from '../../../services/API/pekerjaApi';
 import { SKTHeaderItem, SKTDetail, SetoranWorker, TestTempRow } from '../../../services/skt';
+import { MasterPekerja } from '../../../services/pekerja';
+import { dedupeById } from '../../../utils/dedupe';
 import {
   saveToCache,
   loadFromCache,
@@ -120,7 +123,11 @@ export default function SKTHeaderDashboardScreen() {
     isRefresh ? setIsRefreshing(true) : setIsLoading(true);
     setError(null);
     try {
-      const data = await fetchSktHeaderList();
+      // fetchSktHeaderList already dedupes at the fetch boundary (see
+      // fetchSktHeaderRows in sktApi.ts) — deduped again here, same as
+      // syncAllFromOrds below, so this pull-to-refresh GET carries the same
+      // guarantee right at the point it's written to AsyncStorage.
+      const data = dedupeById(await fetchSktHeaderList(), (item) => item.id);
       setItems(data);
       await saveToCache(CACHE_KEYS.SKT_LIST, data);
     } catch {
@@ -156,14 +163,27 @@ export default function SKTHeaderDashboardScreen() {
     try {
       const previousList = (await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST)) ?? [];
       const details = await fetchAllSktDetails();
-      const list: SKTHeaderItem[] = details.map(({ detail }) => detail);
+      // fetchAllSktDetails already dedupes skt_header/skt_view at the fetch
+      // boundary (see fetchSktHeaderRows/fetchSktViewRows in sktApi.ts), but
+      // this list/each detail's `workers` gets one more explicit pass right
+      // here, at the point they're actually written to AsyncStorage — the
+      // "Get Data" cache write is the one place this MUST hold, so it isn't
+      // left implicit on an upstream fetch never regressing.
+      const list: SKTHeaderItem[] = dedupeById(
+        details.map(({ detail }) => detail),
+        (item) => item.id
+      );
       const freshIds = new Set(list.map((item) => item.id));
 
       setItems(list);
 
       // Only overwrite each cache entry if ORDS actually returned
       // something different from what's already cached — an unchanged
-      // fetch is a no-op write, not a fresh replace.
+      // fetch is a no-op write, not a fresh replace. A previously-cached
+      // list/detail that had duplicates in it will always differ from the
+      // deduped fresh one (different length, if nothing else), so this
+      // still guarantees the overwrite — and with it, the duplicates —
+      // happens.
       if (!isSameCachedValue(previousList, list)) {
         await saveToCache(CACHE_KEYS.SKT_LIST, list);
       }
@@ -174,7 +194,7 @@ export default function SKTHeaderDashboardScreen() {
           const previousDetail = await loadFromCache<{ detail: SKTDetail; workers: SetoranWorker[] }>(
             cacheKey
           );
-          const freshDetail = { detail, workers };
+          const freshDetail = { detail, workers: dedupeById(workers, (w) => w.id) };
           if (!isSameCachedValue(previousDetail, freshDetail)) {
             await saveToCache(cacheKey, freshDetail);
           }
@@ -191,12 +211,29 @@ export default function SKTHeaderDashboardScreen() {
       // (or fall back) the SKT data above, so it gets its own try/catch.
       try {
         const previousTestTemp = await loadFromCache<TestTempRow[]>(CACHE_KEYS.TEST_TEMP);
-        const testTempRows = await fetchTestTempData();
+        const testTempRows = dedupeById(await fetchTestTempData(), (r) => r.id);
         if (!isSameCachedValue(previousTestTemp, testTempRows)) {
           await saveToCache(CACHE_KEYS.TEST_TEMP, testTempRows);
         }
       } catch (testTempError) {
         console.warn('Failed to refresh skt/test_temp:', testTempError);
+      }
+
+      // skt_master_pekerja — the worker directory the badge scanner
+      // (AbsensiScanScreenCamera, via findMasterPekerjaByNik in
+      // pekerjaApi.ts) matches a scanned NIK against. Cached here, same
+      // as test_temp above, so that scan never needs a live GET of its
+      // own — its own try/catch for the same reason.
+      try {
+        const previousMasterPekerja = await loadFromCache<MasterPekerja[]>(
+          CACHE_KEYS.MASTER_PEKERJA
+        );
+        const masterPekerjaRows = dedupeById(await fetchMasterPekerja(), (r) => r.id);
+        if (!isSameCachedValue(previousMasterPekerja, masterPekerjaRows)) {
+          await saveToCache(CACHE_KEYS.MASTER_PEKERJA, masterPekerjaRows);
+        }
+      } catch (masterPekerjaError) {
+        console.warn('Failed to refresh skt_master_pekerja:', masterPekerjaError);
       }
     } catch {
       // Fall back to the last cached list — likely offline, or the

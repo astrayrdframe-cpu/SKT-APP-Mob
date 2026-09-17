@@ -1,4 +1,6 @@
 import { buildDetailPekerja, MasterPekerja } from '../pekerja';
+import { loadFromCache, CACHE_KEYS } from '../Offline/persistence';
+import { dedupeById } from '../../utils/dedupe';
 
 const SKT_MASTER_PEKERJA_ENDPOINT =
   'http://apps.nti-skt.net:8080/ords/sktntidev/skt/skt_master_pekerja';
@@ -59,7 +61,12 @@ export interface FetchMasterPekerjaOptions {
 export async function fetchMasterPekerja(
   options?: FetchMasterPekerjaOptions
 ): Promise<MasterPekerja[]> {
-  const rows = (await fetchAllOrdsRows(SKT_MASTER_PEKERJA_ENDPOINT)) as RawPekerjaRow[];
+  const rowsRaw = (await fetchAllOrdsRows(SKT_MASTER_PEKERJA_ENDPOINT)) as RawPekerjaRow[];
+  // Dropped here, at the fetch boundary — see dedupeById's own comment in
+  // utils/dedupe.ts for why (a dirty view/join, or a pagination overlap,
+  // shouldn't surface downstream as a duplicate name in the "Pilih
+  // Pekerja" combobox or CACHE_KEYS.MASTER_PEKERJA).
+  const rows = dedupeById(rowsRaw, (r) => r.id);
 
   return rows
     .filter((row) => options?.includeInactive || row.active === 1)
@@ -83,26 +90,19 @@ export async function fetchMasterPekerja(
 /**
  * Looks up a single pekerja by NIK — used by the attendance QR scanner so
  * an admin can scan a worker's ID card/QR instead of searching by name.
- * Uses ORDS's `q` filter to fetch just the matching row rather than
- * pulling the whole directory for a single lookup.
+ *
+ * Reads CACHE_KEYS.MASTER_PEKERJA instead of hitting ORDS live — same
+ * "no direct GET from a feature screen" rule the rest of the app follows
+ * (see loadDetail's disabled GET in SKTHeaderDetailScreen.tsx). That cache
+ * is populated by fetchMasterPekerja() during the Dashboard's "Get Data"
+ * sync, so a scan works fully offline between syncs; it just won't see a
+ * worker added to skt_master_pekerja after the last sync until the next
+ * one runs. `active`/`isTraining` are re-checked here rather than trusted
+ * blindly, since a stale cache entry could in principle predate a
+ * deactivation.
  */
 export async function findMasterPekerjaByNik(nik: string): Promise<MasterPekerja | null> {
-  const filter = encodeURIComponent(JSON.stringify({ nik }));
-  const rows = (await fetchAllOrdsRows(
-    `${SKT_MASTER_PEKERJA_ENDPOINT}?q=${filter}`
-  )) as RawPekerjaRow[];
-
-  const match = rows.find((row) => row.active === 1 && row.is_training === 0);
-  if (!match) return null;
-
-  return {
-    id: match.id,
-    nomorAbsen: match.nomor_absen,
-    nik: match.nik,
-    namaPekerja: match.nama_pekerja,
-    detailPekerja: buildDetailPekerja(match.nomor_absen, match.nama_pekerja, match.nik),
-    active: match.active === 1,
-    isTraining: match.is_training === 1,
-    brakId: match.skt_master_brak_id,
-  };
+  const cached = (await loadFromCache<MasterPekerja[]>(CACHE_KEYS.MASTER_PEKERJA)) ?? [];
+  const match = cached.find((row) => row.nik === nik && row.active && !row.isTraining);
+  return match ?? null;
 }

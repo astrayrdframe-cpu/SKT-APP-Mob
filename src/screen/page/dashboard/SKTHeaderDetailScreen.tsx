@@ -16,6 +16,8 @@ import {
   addPekerjaToMeja,
   deletePekerjaFromMeja,
   submitSetoran,
+  updateSetoran,
+  deleteSetoran,
   SubmitSetoranPayload,
 } from '../../../services/API/sktApi';
 import { SKTDetail, SetoranWorker } from '../../../services/skt';
@@ -24,8 +26,36 @@ import { useOffline } from '../../../context/OfflineContext';
 import DetailMejaModal from '../components/DetailMejaModal';
 import TambahPekerjaModal from '../components/TambahPekerjaModal';
 import TambahSetoranModal from '../setoran/TambahSetoranModal';
-import { groupWorkersByMeja, pairSetoranByMeja } from '../../../utils/mejaGrouping';
-import { MasterPekerja } from '../../../services/pekerja';
+import {
+  groupWorkersByMeja,
+  pairSetoranByMeja,
+  pekerjaHasSetoran,
+  workerIsGiling,
+  SetoranPairRow,
+} from '../../../utils/mejaGrouping';
+import { MasterPekerja, buildDetailPekerja } from '../../../services/pekerja';
+
+// Reshapes an existing SetoranWorker row into the MasterPekerja shape
+// TambahSetoranModal's giling/batil state expects, so tapping a List
+// Setoran card can pre-fill "already scanned" without a re-scan. `id` here
+// is the row's skt_log_pekerja_id, not a real skt_master_pekerja.id — fine
+// for edit-mode pre-fill/display, since editing never re-submits it through
+// addPekerjaToMeja; a genuine re-scan (onPressScanGiling/Batil) always
+// overwrites it with the real master id anyway. active/isTraining/brakId
+// have no equivalent on SetoranWorker, so they're filled with harmless
+// defaults purely to satisfy the type.
+function workerToPekerjaStub(w: SetoranWorker): MasterPekerja {
+  return {
+    id: w.id,
+    nomorAbsen: w.nomorAbsen,
+    nik: w.nik,
+    namaPekerja: w.namaPekerja,
+    detailPekerja: buildDetailPekerja(w.nomorAbsen, w.namaPekerja, w.nik),
+    active: true,
+    isTraining: false,
+    brakId: 0,
+  };
+}
 
 type DetailRouteProp = RouteProp<RootStackParamList, 'SKTHeaderDetail'>;
 type NavProp = NativeStackNavigationProp<RootStackParamList, 'SKTHeaderDetail'>;
@@ -66,9 +96,13 @@ export default function SKTHeaderDetailScreen() {
   // state) exactly when the admin taps "+ Tambah Setoran" again, and
   // leaves its state alone while it's just being hidden behind the scanner.
   const [tambahSetoranKey, setTambahSetoranKey] = useState(0);
-  // The admin's pick from the "Meja" dropdown, only meaningful (and only
-  // shown) while the header tab is on "Semua Meja" — see setoranTargetMeja.
-  const [setoranMejaOverride, setSetoranMejaOverride] = useState<number | null>(null);
+  // Non-null while TambahSetoranModal is open in edit mode (tapped a List
+  // Setoran card) instead of the ordinary "+ Tambah Setoran" add flow — set
+  // by handleEditSetoran, cleared once that edit is submitted, deleted, or
+  // cancelled. Drives which nomorMeja/setoranKe/existingSetoranId/initial*
+  // values get passed to the modal, and which of handleSubmitTambahSetoran
+  // / handleSubmitEditSetoran its onSubmit points at.
+  const [editingPair, setEditingPair] = useState<SetoranPairRow | null>(null);
   const [isSubmittingSetoran, setIsSubmittingSetoran] = useState(false);
   const [scannedSetoranGiling, setScannedSetoranGiling] = useState<MasterPekerja | null>(null);
   const [scannedSetoranBatil, setScannedSetoranBatil] = useState<MasterPekerja | null>(null);
@@ -131,14 +165,6 @@ export default function SKTHeaderDetailScreen() {
     )[];
   }, [detail?.jumlahMeja]);
 
-  // Just the numeric meja numbers, no 'Semua Meja' — this is what the
-  // "Meja" field inside Tambah Setoran picks from when the header tab is
-  // on 'Semua Meja' (see setoranTargetMeja/mejaOptions below).
-  const mejaNumberOptions = useMemo(
-    () => mejaTabs.filter((t): t is number => typeof t === 'number'),
-    [mejaTabs]
-  );
-
   const filteredWorkers = useMemo(() => {
     if (selectedMeja === 'Semua Meja') return workers;
     return workers.filter((w) => w.nomorMeja === selectedMeja);
@@ -161,28 +187,29 @@ export default function SKTHeaderDetailScreen() {
     [mejaGroups, activeAddMeja]
   );
 
-  // Which meja a fresh "+ Tambah Setoran" attaches to: the currently
-  // selected meja tab, or — since there's no meja-agnostic submission in
-  // this schema — the admin's own pick from the "Meja" dropdown inside the
-  // dialog when the header tab is on "Semua Meja" (defaulting to the first
-  // meja until they change it).
-  const setoranTargetMeja =
-    selectedMeja === 'Semua Meja' ? setoranMejaOverride ?? mejaNumberOptions[0] ?? 1 : selectedMeja;
-
-  // ASSUMPTION: "Setoran ke" is the next sequence number for that meja —
-  // i.e. one more than however many setoran rows already exist there.
-  // The real rule (per giling+batil pair vs. per meja) isn't confirmed
-  // yet; the server should be treated as the source of truth once the
-  // real endpoint lands.
-  const setoranTargetKe =
-    workers.filter((w) => w.nomorMeja === setoranTargetMeja).length + 1;
-
   const handleTambahSetoran = () => {
+    setEditingPair(null);
     setScannedSetoranGiling(null);
     setScannedSetoranBatil(null);
     setScannedTrayCode(null);
     setScannedTrayToken(0);
-    setSetoranMejaOverride(null);
+    setTambahSetoranKey((k) => k + 1);
+    setShowTambahSetoran(true);
+  };
+
+  // Tapping a List Setoran card — opens the same dialog as "+ Tambah
+  // Setoran" but pre-filled from the tapped pair, with Hapus available (see
+  // existingSetoranId/initialGiling/initialBatil/initialBarcodeTrays/
+  // initialBadWaste on TambahSetoranModal). Both rows must exist (an
+  // unmatched giling-only or batil-only "pair" — see pairSetoranByMeja —
+  // isn't a complete submission and has nothing sensible to edit/delete).
+  const handleEditSetoran = (pair: SetoranPairRow) => {
+    if (!pair.giling || !pair.batil) return;
+    setEditingPair(pair);
+    setScannedSetoranGiling(null);
+    setScannedSetoranBatil(null);
+    setScannedTrayCode(null);
+    setScannedTrayToken(0);
     setTambahSetoranKey((k) => k + 1);
     setShowTambahSetoran(true);
   };
@@ -237,15 +264,143 @@ export default function SKTHeaderDetailScreen() {
     }
   };
 
+  // Edit-mode counterpart to handleSubmitTambahSetoran — rewrites the two
+  // existing rows (via updateSetoran) instead of appending new ones.
+  const handleSubmitEditSetoran = async (payload: SubmitSetoranPayload) => {
+    if (!editingPair?.giling || !editingPair?.batil) return;
+    const { giling: oldGiling, batil: oldBatil } = editingPair;
+    setIsSubmittingSetoran(true);
+    try {
+      // payload.giling.kode/payload.batil.kode already carry the pair's
+      // real seat kode — sourced from initialGilingKode/initialBatilKode
+      // below, since re-scanning is disabled while editing — so there's
+      // nothing extra to pass through for that here.
+      const updatedRows = await updateSetoran({
+        ...payload,
+        gilingId: oldGiling.id,
+        batilId: oldBatil.id,
+        transactionId: oldGiling.transactionId ?? oldBatil.transactionId,
+      });
+      const updatedWorkers = workers
+        .filter((w) => w.id !== oldGiling.id && w.id !== oldBatil.id)
+        .concat(updatedRows);
+      setWorkers(updatedWorkers);
+      await persistWorkers(updatedWorkers);
+      setShowTambahSetoran(false);
+      setEditingPair(null);
+    } catch {
+      Alert.alert(
+        'Gagal Menyimpan',
+        'Terjadi kesalahan saat menyimpan perubahan setoran. Silakan coba lagi.'
+      );
+    } finally {
+      setIsSubmittingSetoran(false);
+    }
+  };
+
+  // Hapus inside the edit-mode dialog — TambahSetoranModal already confirms
+  // via Alert.alert before calling this (see its handleHapus), so this just
+  // performs the removal.
+  //
+  // "Delete the setoran, not the worker": Detail Meja's roster and List
+  // Setoran's cards are both derived from the same `workers` array (see
+  // groupWorkersByMeja/pairSetoranByMeja in utils/mejaGrouping.ts) — for a
+  // pair that was never a standalone Tambah Setoran submission (no
+  // `transactionId`; just two roster seats pairing up positionally, e.g.
+  // the "0 Selongsong" cards a bare Tambah Pekerja seat already produces),
+  // the Giling/Batil row IS the roster seat, not a separate record. Simply
+  // filtering those two ids out of `workers` would silently delete the
+  // seat too, which is exactly what shouldn't happen here.
+  //
+  // So each side is only fully removed if the SAME person+role still has
+  // another seat left at this meja afterward (a genuine standalone
+  // submission row, distinct from its own roster seat — safe to drop
+  // entirely, and the card disappears because the row is just gone).
+  // Otherwise this row IS their only seat: it's kept — same id/kode/name/
+  // nik/meja as before, so Detail Meja shows no change at all — but its
+  // setoran-specific fields are stripped back to "never submitted" AND
+  // flagged setoranDeleted (see that field's comment in skt.ts), which is
+  // what actually makes pairSetoranByMeja stop producing a card for it.
+  // Resetting the fields without the flag isn't enough on its own — a bare
+  // roster seat already reads as an unsubmitted "0/0/0" pair (see
+  // pairSetoranByMeja's positional fallback), so the card would just keep
+  // showing up looking identical to before "deleting" it.
+  const handleDeleteSetoranPair = async () => {
+    if (!editingPair?.giling || !editingPair?.batil) return;
+    const { giling, batil, nomorMeja } = editingPair;
+    try {
+      await deleteSetoran({ sktHeaderId: item.id, nomorMeja, gilingId: giling.id, batilId: batil.id });
+
+      const updatedWorkers = workers.flatMap((w) => {
+        if (w.id !== giling.id && w.id !== batil.id) return [w];
+
+        const isGiling = workerIsGiling(w);
+        const stillSeatedElsewhere = workers.some(
+          (other) =>
+            other.id !== w.id &&
+            other.nomorMeja === w.nomorMeja &&
+            other.nik === w.nik &&
+            workerIsGiling(other) === isGiling
+        );
+        if (stillSeatedElsewhere) return []; // a genuine standalone submission row — safe to drop
+
+        const { totalSetoran, totalDefect, setoranKe, transactionId, trayCount, barcodeTrays, ...seat } = w;
+        return [{ ...seat, totalSetoran: 0, totalDefect: 0, setoranDeleted: true }];
+      });
+
+      setWorkers(updatedWorkers);
+      await persistWorkers(updatedWorkers);
+      setShowTambahSetoran(false);
+      setEditingPair(null);
+    } catch {
+      Alert.alert(
+        'Gagal Menghapus',
+        'Terjadi kesalahan saat menghapus setoran. Silakan coba lagi.'
+      );
+    }
+  };
+
   const handleAddPekerja = (nomorMeja: number) => {
     setActiveAddMeja(nomorMeja);
     setScannedPekerja(null);
     setShowTambahPekerja(true);
   };
 
-  const handleDeletePekerja = (nomorMeja: number, pekerjaId: number) => {
+  // Re-reads whatever's actually persisted for this record right now,
+  // falling back to in-memory `workers` if nothing's cached yet (e.g. a
+  // brand-new record still running only off `preview`). Belt-and-suspenders
+  // around the delete-pekerja guard below: `workers` state is written back
+  // to AsyncStorage immediately after every mutation (see persistWorkers),
+  // so in normal use it's never actually behind the cache — but the guard
+  // is a hard "can't delete" rule, so it re-confirms against the source of
+  // truth on disk rather than trusting whatever's currently in React state.
+  const loadLatestWorkersFromCache = useCallback(async (): Promise<SetoranWorker[]> => {
+    const cached = await loadFromCache<CachedDetail>(sktDetailCacheKey(id));
+    return cached?.workers ?? workers;
+  }, [id, workers]);
+
+  const handleDeletePekerja = async (nomorMeja: number, pekerjaId: number) => {
     const worker = workers.find((w) => w.id === pekerjaId);
     const label = worker ? worker.namaPekerja : 'pekerja ini';
+
+    // Can't delete a seat once that exact person (by NIK), in that same
+    // role, is showing up paired with a Giling/Batil counterpart in List
+    // Setoran for this meja — applies whether that role is Giling or
+    // Batil. Checked against the freshly persisted cache, not just
+    // in-memory `workers` (see loadLatestWorkersFromCache above). See
+    // pekerjaHasSetoran's own comment in utils/mejaGrouping.ts for exactly
+    // what counts as "paired", and why the match is by NIK+role rather
+    // than exact kode.
+    if (worker) {
+      const latestWorkers = await loadLatestWorkersFromCache();
+      if (pekerjaHasSetoran(latestWorkers, nomorMeja, worker)) {
+        Alert.alert(
+          'Tidak Bisa Dihapus',
+          `${worker.namaPekerja} sudah memiliki setoran di Meja ${nomorMeja} dan tidak bisa dihapus.`
+        );
+        return;
+      }
+    }
 
     Alert.alert('Hapus Pekerja', `Yakin ingin menghapus ${label} dari Meja ${nomorMeja}?`, [
       { text: 'Batal', style: 'cancel' },
@@ -255,6 +410,20 @@ export default function SKTHeaderDetailScreen() {
         onPress: async () => {
           setDeletingPekerjaId(pekerjaId);
           try {
+            // Re-checked once more right before the actual delete — closes
+            // the (small) window between confirming the dialog and this
+            // running, in case a setoran was recorded for this same
+            // person/role in the meantime.
+            if (worker) {
+              const latestWorkers = await loadLatestWorkersFromCache();
+              if (pekerjaHasSetoran(latestWorkers, nomorMeja, worker)) {
+                Alert.alert(
+                  'Tidak Bisa Dihapus',
+                  `${worker.namaPekerja} sudah memiliki setoran di Meja ${nomorMeja} dan tidak bisa dihapus.`
+                );
+                return;
+              }
+            }
             await deletePekerjaFromMeja({ sktHeaderId: item.id, nomorMeja, pekerjaId });
             const updatedWorkers = workers.filter((w) => w.id !== pekerjaId);
             setWorkers(updatedWorkers);
@@ -442,7 +611,13 @@ export default function SKTHeaderDetailScreen() {
         ) : (
           <View style={styles.setoranListWrapper}>
             {setoranPairs.map((pair) => (
-              <View key={pair.key} style={styles.setoranCard}>
+              <TouchableOpacity
+                key={pair.key}
+                style={styles.setoranCard}
+                activeOpacity={0.7}
+                onPress={() => handleEditSetoran(pair)}
+                disabled={!pair.giling || !pair.batil}
+              >
                 <View style={styles.pairTopRow}>
                   <Text style={styles.pairMejaLabel}>Meja {pair.nomorMeja}</Text>
                   <View style={styles.pairSetoranBadge}>
@@ -481,7 +656,7 @@ export default function SKTHeaderDetailScreen() {
                     <Text style={styles.badText}>Bad: {pair.bad}</Text>
                   </View>
                 </View>
-              </View>
+              </TouchableOpacity>
             ))}
           </View>
         )}
@@ -550,18 +725,50 @@ export default function SKTHeaderDetailScreen() {
       <TambahSetoranModal
         key={tambahSetoranKey}
         visible={showTambahSetoran}
-        onClose={() => setShowTambahSetoran(false)}
+        onClose={() => {
+          setShowTambahSetoran(false);
+          setEditingPair(null);
+        }}
         sktHeaderId={item.id}
         brand={item.brand}
         jenisLabel={item.jenisLabel}
         brakLabel={`Brak ${item.brakId}`}
-        nomorMeja={setoranTargetMeja}
-        mejaOptions={selectedMeja === 'Semua Meja' ? mejaNumberOptions : undefined}
-        onChangeMeja={setSetoranMejaOverride}
+        // Editing an existing submission keeps it pinned to its own meja —
+        // a fresh add starts with no meja at all, and no candidate list
+        // pre-filtered to one either (see TambahSetoranModal's mejaGroups
+        // prop): the admin now picks Giling/Batil from every worker on this
+        // header, and the meja is derived from whoever they actually pick,
+        // regardless of which tab happens to be active here.
+        nomorMeja={editingPair ? editingPair.nomorMeja : null}
         mejaGroups={mejaGroups}
-        setoranKe={setoranTargetKe}
+        // Null until both Giling and Batil are actually picked (see
+        // computePairSetoranKe in utils/mejaGrouping.ts) — TambahSetoranModal
+        // computes the real, pair-scoped number itself once that happens;
+        // edit mode always uses the pair's real, immutable value.
+        setoranKe={editingPair ? editingPair.setoranKe : null}
+        workers={workers}
         isSubmitting={isSubmittingSetoran}
-        onSubmit={handleSubmitTambahSetoran}
+        onSubmit={editingPair ? handleSubmitEditSetoran : handleSubmitTambahSetoran}
+        existingSetoranId={
+          editingPair?.giling && editingPair?.batil
+            ? { gilingId: editingPair.giling.id, batilId: editingPair.batil.id }
+            : null
+        }
+        onDelete={handleDeleteSetoranPair}
+        initialGiling={editingPair?.giling ? workerToPekerjaStub(editingPair.giling) : null}
+        initialBatil={editingPair?.batil ? workerToPekerjaStub(editingPair.batil) : null}
+        initialGilingKode={editingPair?.giling?.kodeSetoran ?? null}
+        initialBatilKode={editingPair?.batil?.kodeSetoran ?? null}
+        // Older/fetched rows don't carry the real per-tray list (see
+        // SetoranWorker.barcodeTrays in skt.ts) — fall back to one synthetic
+        // row standing in for the existing total, so editing Bad/Waste on
+        // them doesn't force a full re-scan just to keep Submit enabled.
+        initialBarcodeTrays={
+          editingPair?.giling?.barcodeTrays ??
+          editingPair?.batil?.barcodeTrays ??
+          (editingPair ? [{ code: `Setoran #${editingPair.setoranKe}`, batang: editingPair.good }] : [])
+        }
+        initialBadWaste={editingPair?.bad ?? 0}
         onPressScanGiling={() => handlePressScanSetoran('giling')}
         onPressScanBatil={() => handlePressScanSetoran('batil')}
         onPressScanTray={() => handlePressScanSetoran('tray')}

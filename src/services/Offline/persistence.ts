@@ -36,6 +36,12 @@ export const CACHE_KEYS = {
   FILTER_DATA: 'skt-filter-data',
   SKT_LIST: 'skt-header-list-v2', // bumped: v1 shape is incompatible with current SKTHeaderItem
   TEST_TEMP: 'skt-test-temp', // skt/test_temp rows, refreshed on Dashboard "Get Data"
+  // skt_master_pekerja rows (active, non-training only — see
+  // fetchMasterPekerja's default filters), refreshed on Dashboard "Get
+  // Data" alongside TEST_TEMP above. AbsensiScanScreenCamera's badge-scan
+  // lookup (findMasterPekerjaByNik in pekerjaApi.ts) reads this instead of
+  // hitting ORDS live on every single scan.
+  MASTER_PEKERJA: 'skt-master-pekerja',
 } as const;
 
 // Each SKT detail record is cached individually, keyed by its id, so a

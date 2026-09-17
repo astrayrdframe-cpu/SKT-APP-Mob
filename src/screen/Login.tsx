@@ -59,6 +59,26 @@ export default function LoginScreen() {
         loadPreferences();
     }, []);
 
+    // Dev-only escape hatch for when the backend/API is unreachable (e.g.
+    // off the office network/VPN) and you still need to poke around the
+    // rest of the app. Stripped out of release builds by __DEV__ — this
+    // button literally does not exist in a production APK/IPA, so it can
+    // never be found or used as a real backdoor. It does NOT hit the API
+    // at all; it just fabricates a local session so downstream screens
+    // have something to render.
+    const handleDevMockLogin = async () => {
+        await setSession({
+            token: 'DEV-MOCK-TOKEN',
+            // Expires in 1 day — long enough for a testing session, short
+            // enough that it doesn't linger forever if forgotten.
+            expiry: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+            user: {
+                username: 'dev-mock-admin',
+                nama_brak: 'Mock Brak (Dev Only)',
+            },
+        });
+    };
+
     const handleLogin = async () => {
         if (!username.trim() || !password.trim()) {
             Alert.alert('Validation Error', 'Please enter both username and password');
@@ -205,6 +225,22 @@ export default function LoginScreen() {
                             {loading ? 'Memproses...' : 'Masuk'}
                         </Text>
                     </TouchableOpacity>
+
+                    {/* Visible only in dev builds (__DEV__ is compiled out of
+                        release builds) — lets you get past the login screen
+                        without a working API connection, for local UI
+                        testing only. Never present in a real install. */}
+                    {__DEV__ && (
+                        <TouchableOpacity
+                            style={styles.devButton}
+                            onPress={handleDevMockLogin}
+                            activeOpacity={0.8}>
+                            <Icon name="bug" size={14} color="#B45309" solid />
+                            <Text style={styles.devButtonText}>
+                                Skip Login (Dev Mock — API Offline)
+                            </Text>
+                        </TouchableOpacity>
+                    )}
                 </View>
 
             </ScrollView>
@@ -357,5 +393,25 @@ const styles = StyleSheet.create({
         fontSize: 16,
         fontWeight: '600',
         letterSpacing: 0.5,
+    },
+    // Dev-only mock login button — styled distinctly (dashed amber border)
+    // so it visually reads as "not a real feature" whenever it happens to
+    // be visible during development.
+    devButton: {
+        flexDirection: 'row',
+        justifyContent: 'center',
+        alignItems: 'center',
+        gap: 8,
+        height: 44,
+        borderRadius: 12,
+        borderWidth: 1,
+        borderStyle: 'dashed',
+        borderColor: '#B45309',
+        marginTop: 12,
+    },
+    devButtonText: {
+        color: '#B45309',
+        fontSize: 12,
+        fontWeight: '600',
     },
 });
