@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 
@@ -11,20 +11,36 @@ import { useNavigation } from '@react-navigation/native';
 // navigator down with it, including every other screen. `require()` inside
 // try/catch is a normal function call, so a bad camera install now only
 // breaks this one screen.
-let CameraScreen: React.ComponentType | null = null;
+//
+// The require() itself is deferred to first RENDER (via loadCameraScreen
+// below), same reasoning as AbsensiScanScreen.tsx — mainNavigation.tsx now
+// imports this wrapper eagerly, so this module's own top level runs as part
+// of the very first JS bundle evaluation; touching the camera native module
+// that early broke it specifically after a dev "Reload" (JS context torn
+// down and re-run, native side left alive, bridge not necessarily done
+// re-registering modules yet). Waiting for first render — i.e. the
+// BarcodeTrayScan route actually being opened — fixes that on both a cold
+// start and a reload.
+let CameraScreen: React.ComponentType | null | undefined; // undefined = not attempted yet
 let loadErrorMessage: string | null = null;
 
-try {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  CameraScreen = require('./BarcodeTrayScanScreenCamera').default;
-} catch (err) {
-  loadErrorMessage = err instanceof Error ? err.message : String(err);
+function loadCameraScreen(): React.ComponentType | null {
+  if (CameraScreen !== undefined) return CameraScreen; // already attempted — reuse the result
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    CameraScreen = require('./BarcodeTrayScanScreenCamera').default;
+  } catch (err) {
+    loadErrorMessage = err instanceof Error ? err.message : String(err);
+    CameraScreen = null;
+  }
+  return CameraScreen ?? null;
 }
 
 export default function BarcodeTrayScanScreen() {
   const navigation = useNavigation();
+  const [Camera] = useState(loadCameraScreen);
 
-  if (!CameraScreen) {
+  if (!Camera) {
     return (
       <View style={styles.screen}>
         <View style={styles.topBar}>
@@ -49,7 +65,7 @@ export default function BarcodeTrayScanScreen() {
     );
   }
 
-  return <CameraScreen />;
+  return <Camera />;
 }
 
 const styles = StyleSheet.create({

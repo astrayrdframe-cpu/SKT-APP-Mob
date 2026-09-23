@@ -121,10 +121,6 @@ export default function TambahPekerjaModal({
     };
   }, [visible, brakId]);
 
-  // AbsensiScanScreen's lazy chunk is now warmed once up front, as soon as
-  // the navigator mounts (see mainNavigation.tsx) — no need to repeat that
-  // here every time this dialog opens.
-
   // Pre-fill the search box and selection whenever a fresh scan result
   // arrives from AbsensiScanScreen — this is the "just scan the ID card"
   // shortcut for the same search+select flow, so Kode Pekerja availability

@@ -125,7 +125,11 @@ function toPairRow(nomorMeja: number, key: string, g: SetoranWorker | null, b: S
   };
 }
 
-export function pairSetoranByMeja(workers: SetoranWorker[]): SetoranPairRow[] {
+export function pairSetoranByMeja(
+  workers: SetoranWorker[],
+  options?: { includeDeleted?: boolean }
+): SetoranPairRow[] {
+  const includeDeleted = options?.includeDeleted ?? false;
   const mejaNumbers = Array.from(new Set(workers.map((w) => w.nomorMeja))).sort((a, b) => a - b);
 
   return mejaNumbers.flatMap((nomorMeja) => {
@@ -133,8 +137,13 @@ export function pairSetoranByMeja(workers: SetoranWorker[]): SetoranPairRow[] {
     // skt.ts) are a deliberately-deleted transaction whose seat had to be
     // kept for Detail Meja's sake — excluded here so they stop producing a
     // card, but groupWorkersByMeja (the roster) never applies this filter,
-    // so the seat itself still shows up there untouched.
-    const mejaWorkers = workers.filter((w) => w.nomorMeja === nomorMeja && !w.setoranDeleted);
+    // so the seat itself still shows up there untouched. computePairSetoranKe
+    // passes includeDeleted so a deleted submission's number still counts
+    // toward "highest setoranKe ever used" — the running counter must never
+    // reissue a number a deleted submission already used (see that function).
+    const mejaWorkers = workers.filter(
+      (w) => w.nomorMeja === nomorMeja && (includeDeleted || !w.setoranDeleted)
+    );
 
     // Rows carrying a real `transactionId` pair up exactly — no positional
     // guessing needed, since the two rows of one submission share that id
@@ -236,6 +245,14 @@ export function pekerjaHasSetoran(
 // submission. Not used in edit mode — re-scanning is disabled there (see
 // TambahSetoranModal's isEditing), so the pair can't change and the
 // original setoranKe is reused as-is.
+//
+// A running counter, NOT a count of surviving submissions: takes the
+// highest `setoranKe` this pair has ever used (including deleted
+// submissions — pairSetoranByMeja's includeDeleted) and adds 1. Counting
+// survivors instead would reissue a deleted submission's number the moment
+// enough other submissions got deleted to bring the count back down to it
+// — e.g. #1-#4 with #2 deleted leaves 3 survivors, and count+1 = #4 again,
+// colliding with the #4 that already exists.
 export function computePairSetoranKe(
   workers: SetoranWorker[],
   nomorMeja: number,
@@ -245,15 +262,18 @@ export function computePairSetoranKe(
   const gilingIdentity = buildDetailPekerja(giling.nomorAbsen, giling.namaPekerja, giling.nik);
   const batilIdentity = buildDetailPekerja(batil.nomorAbsen, batil.namaPekerja, batil.nik);
 
-  const matchingSubmissions = pairSetoranByMeja(
-    workers.filter((w) => w.nomorMeja === nomorMeja)
-  ).filter(
-    (p) =>
-      p.giling &&
-      p.batil &&
-      buildDetailPekerja(p.giling.nomorAbsen, p.giling.namaPekerja, p.giling.nik) === gilingIdentity &&
-      buildDetailPekerja(p.batil.nomorAbsen, p.batil.namaPekerja, p.batil.nik) === batilIdentity
-  ).length;
+  const maxSetoranKe = pairSetoranByMeja(
+    workers.filter((w) => w.nomorMeja === nomorMeja),
+    { includeDeleted: true }
+  )
+    .filter(
+      (p) =>
+        p.giling &&
+        p.batil &&
+        buildDetailPekerja(p.giling.nomorAbsen, p.giling.namaPekerja, p.giling.nik) === gilingIdentity &&
+        buildDetailPekerja(p.batil.nomorAbsen, p.batil.namaPekerja, p.batil.nik) === batilIdentity
+    )
+    .reduce((max, p) => Math.max(max, p.setoranKe), 0);
 
-  return matchingSubmissions + 1;
+  return maxSetoranKe + 1;
 }

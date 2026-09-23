@@ -54,6 +54,19 @@ function isSameCachedValue(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+// jumlahMeja is read off skt_view, not skt_header itself (see
+// SKTHeaderItem.jumlahMeja's comment in skt.ts) — a header with none means
+// no skt_view rows exist for it at all: no meja, no pekerja, no setoran was
+// ever attached to it server-side. That's not a real, usable SKT record
+// from this app's point of view, so it's dropped everywhere a fetched list
+// gets shown or written to cache (loadData/syncAllFromOrds below) — nothing
+// deletes the underlying skt_header row on the backend (this app has no
+// endpoint for that), it just never surfaces here, in-app or in the local
+// cache, on either an online fetch or an offline cache fallback.
+function isUsableHeader(item: SKTHeaderItem): boolean {
+  return item.jumlahMeja > 0;
+}
+
 export default function SKTHeaderDashboardScreen() {
   const navigation = useNavigation<NavProp>();
   const { isOffline } = useOffline();
@@ -126,16 +139,24 @@ export default function SKTHeaderDashboardScreen() {
       // fetchSktHeaderList already dedupes at the fetch boundary (see
       // fetchSktHeaderRows in sktApi.ts) — deduped again here, same as
       // syncAllFromOrds below, so this pull-to-refresh GET carries the same
-      // guarantee right at the point it's written to AsyncStorage.
-      const data = dedupeById(await fetchSktHeaderList(), (item) => item.id);
+      // guarantee right at the point it's written to AsyncStorage. Also
+      // dropped here: any header with no meja data at all (see
+      // isUsableHeader above) — never shown, never (re-)written to cache.
+      const data = dedupeById(await fetchSktHeaderList(), (item) => item.id).filter(isUsableHeader);
       setItems(data);
       await saveToCache(CACHE_KEYS.SKT_LIST, data);
     } catch {
       // Fall back to the last cached list — likely offline, or the
-      // endpoint is temporarily unreachable.
-      const cached = await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST);
+      // endpoint is temporarily unreachable. Filtered the same way as the
+      // live fetch above, and re-saved so a stale meja-less header already
+      // sitting in the cache from before this filter existed gets purged
+      // from local storage even without connectivity.
+      const cached = (await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST))?.filter(
+        isUsableHeader
+      );
       if (cached && cached.length > 0) {
         setItems(cached);
+        await saveToCache(CACHE_KEYS.SKT_LIST, cached);
       } else {
         setError('Unable to load SKT data. Pull down to try again.');
       }
@@ -161,8 +182,18 @@ export default function SKTHeaderDashboardScreen() {
     setIsRefreshing(true);
     setError(null);
     try {
+      // Deliberately NOT filtered by isUsableHeader — this needs to be the
+      // raw previously-cached list so the staleIds sweep below (which diffs
+      // against it) can tell that a meja-less header dropped out of
+      // `freshIds`, and clean up its cache entry. Filtering it here would
+      // hide it from that diff instead.
       const previousList = (await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST)) ?? [];
-      const details = await fetchAllSktDetails();
+      // Meja-less headers (see isUsableHeader above) are dropped right here,
+      // before anything below reads `details` — that makes `list`/freshIds
+      // exclude them automatically, which in turn makes the staleIds sweep
+      // below remove any such header's cache entry left over from before
+      // this filter existed, on top of never writing a fresh one.
+      const details = (await fetchAllSktDetails()).filter(({ detail }) => isUsableHeader(detail));
       // fetchAllSktDetails already dedupes skt_header/skt_view at the fetch
       // boundary (see fetchSktHeaderRows/fetchSktViewRows in sktApi.ts), but
       // this list/each detail's `workers` gets one more explicit pass right
@@ -237,10 +268,15 @@ export default function SKTHeaderDashboardScreen() {
       }
     } catch {
       // Fall back to the last cached list — likely offline, or the
-      // endpoint is temporarily unreachable.
-      const cached = await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST);
+      // endpoint is temporarily unreachable. Filtered and re-saved same as
+      // loadData's fallback above, so a stale meja-less header gets purged
+      // from local storage even on a failed/offline "Get Data".
+      const cached = (await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST))?.filter(
+        isUsableHeader
+      );
       if (cached && cached.length > 0) {
         setItems(cached);
+        await saveToCache(CACHE_KEYS.SKT_LIST, cached);
       } else {
         setError('Unable to load SKT data. Pull down to try again.');
       }
@@ -265,9 +301,6 @@ export default function SKTHeaderDashboardScreen() {
       <View style={styles.topBar}>
         <Text style={styles.topBarTitle}>SKT NTI</Text>
         <View style={styles.topBarActions}>
-          <View style={styles.avatarCircle}>
-            <Text style={styles.avatarGlyph}>◍</Text>
-          </View>
           <TouchableOpacity
             style={styles.refreshButton}
             onPress={() => setIsSyncModalVisible(true)}
@@ -413,15 +446,6 @@ const styles = StyleSheet.create({
   },
   topBarTitle: { color: '#FFFFFF', fontSize: 17, fontWeight: '700' },
   topBarActions: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  avatarCircle: {
-    width: 30,
-    height: 30,
-    borderRadius: 15,
-    backgroundColor: '#FFFFFF',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  avatarGlyph: { color: '#2F5FD1', fontSize: 14 },
   refreshButton: {
     width: 30,
     height: 30,
