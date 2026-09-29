@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   View,
   Text,
-  TextInput,
   TouchableOpacity,
   FlatList,
   ActivityIndicator,
@@ -13,7 +12,7 @@ import {
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import Icon from 'react-native-vector-icons/FontAwesome5';
-import { fetchSktHeaderList, fetchAllSktDetails, fetchTestTempData } from '../../../services/API/sktApi';
+import { fetchAllSktDetails, fetchTestTempData } from '../../../services/API/sktApi';
 import { fetchMasterPekerja } from '../../../services/API/pekerjaApi';
 import { SKTHeaderItem, SKTDetail, SetoranWorker, TestTempRow } from '../../../services/skt';
 import { MasterPekerja } from '../../../services/pekerja';
@@ -28,6 +27,7 @@ import {
 import { useOffline } from '../../../context/OfflineContext';
 import { useAuthStore } from '../../../store/authStore';
 import { getServerNow } from '../../../services/serverTime';
+import { startOfDay, isSameDay, formatShortDate } from '../../../utils/dateFilter';
 import type { RootStackParamList } from '../../navigation/mainNavigation';
 import SinkronisasiDataModal from '../components/SinkronisasiDataModal';
 import ConfirmationModal from '../components/ConfirmationModal';
@@ -74,11 +74,16 @@ export default function SKTHeaderDashboardScreen() {
   const user = useAuthStore((state) => state.user);
 
   const [items, setItems] = useState<SKTHeaderItem[]>([]);
-  const [query, setQuery] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isSyncModalVisible, setIsSyncModalVisible] = useState(false);
+
+  // Date filter replacing the old free-text search — restricted to today
+  // down through H-3 (4 selectable days total), so there's no need for a
+  // full calendar widget, just a short dropdown of those days.
+  const [selectedDate, setSelectedDate] = useState<Date>(() => startOfDay(getServerNow()));
+  const [isDateMenuOpen, setIsDateMenuOpen] = useState(false);
 
   // Ticks once a minute so the greeting below doesn't go stale (e.g. "Good
   // Morning" lingering past noon) if the dashboard is left open across a
@@ -97,6 +102,23 @@ export default function SKTHeaderDashboardScreen() {
     () => greetingForHour(getServerNow().getHours()),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [minuteTick, isLoading, isRefreshing]
+  );
+
+  // Today down through H-3, newest first — the full set of days the date
+  // filter dropdown offers.
+  const dateOptions = useMemo(() => {
+    const today = startOfDay(getServerNow());
+    return Array.from({ length: 4 }, (_, i) => {
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      return d;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [minuteTick]);
+
+  const filteredItems = useMemo(
+    () => items.filter((item) => isSameDay(new Date(item.tanggal), selectedDate)),
+    [items, selectedDate]
   );
 
   // Picking Get Data / Push Data in the sync sheet doesn't run the action
@@ -132,42 +154,26 @@ export default function SKTHeaderDashboardScreen() {
     ]);
   };
 
-  const loadData = useCallback(async (isRefresh = false) => {
+  // Reads whatever's already cached locally — no live network call. This
+  // runs on app start and on pull-to-refresh; the live GET against ORDS only
+  // ever runs from the top-bar refresh button's Sinkronisasi Data → Get Data
+  // flow (see syncAllFromOrds below), so the app never syncs on its own.
+  const loadFromCacheOnly = useCallback(async (isRefresh = false) => {
     isRefresh ? setIsRefreshing(true) : setIsLoading(true);
     setError(null);
     try {
-      // fetchSktHeaderList already dedupes at the fetch boundary (see
-      // fetchSktHeaderRows in sktApi.ts) — deduped again here, same as
-      // syncAllFromOrds below, so this pull-to-refresh GET carries the same
-      // guarantee right at the point it's written to AsyncStorage. Also
-      // dropped here: any header with no meja data at all (see
-      // isUsableHeader above) — never shown, never (re-)written to cache.
-      const data = dedupeById(await fetchSktHeaderList(), (item) => item.id).filter(isUsableHeader);
-      setItems(data);
-      await saveToCache(CACHE_KEYS.SKT_LIST, data);
-    } catch {
-      // Fall back to the last cached list — likely offline, or the
-      // endpoint is temporarily unreachable. Filtered the same way as the
-      // live fetch above, and re-saved so a stale meja-less header already
-      // sitting in the cache from before this filter existed gets purged
-      // from local storage even without connectivity.
       const cached = (await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST))?.filter(
         isUsableHeader
       );
-      if (cached && cached.length > 0) {
-        setItems(cached);
-        await saveToCache(CACHE_KEYS.SKT_LIST, cached);
-      } else {
-        setError('Unable to load SKT data. Pull down to try again.');
-      }
+      setItems(cached ?? []);
     } finally {
       isRefresh ? setIsRefreshing(false) : setIsLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    loadData();
-  }, [loadData]);
+    loadFromCacheOnly();
+  }, [loadFromCacheOnly]);
 
   // "Get Data" (Sinkronisasi Data → confirmed) — a full resync from ORDS,
   // not just the summary list loadData() pulls for pull-to-refresh. Fetches
@@ -268,9 +274,9 @@ export default function SKTHeaderDashboardScreen() {
       }
     } catch {
       // Fall back to the last cached list — likely offline, or the
-      // endpoint is temporarily unreachable. Filtered and re-saved same as
-      // loadData's fallback above, so a stale meja-less header gets purged
-      // from local storage even on a failed/offline "Get Data".
+      // endpoint is temporarily unreachable. Filtered and re-saved so a
+      // stale meja-less header gets purged from local storage even on a
+      // failed/offline "Get Data".
       const cached = (await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST))?.filter(
         isUsableHeader
       );
@@ -278,16 +284,13 @@ export default function SKTHeaderDashboardScreen() {
         setItems(cached);
         await saveToCache(CACHE_KEYS.SKT_LIST, cached);
       } else {
-        setError('Unable to load SKT data. Pull down to try again.');
+        setError('Unable to load SKT data. Tap refresh to try again.');
       }
     } finally {
       setIsRefreshing(false);
     }
   }, []);
 
-  const filteredItems = items.filter((item) =>
-    `${item.brakId} ${item.brand}`.toLowerCase().includes(query.toLowerCase())
-  );
 
   const todayLabel = new Date().toLocaleDateString('id-ID', {
     day: '2-digit',
@@ -329,15 +332,47 @@ export default function SKTHeaderDashboardScreen() {
         </View>
         <Text style={styles.subheading}>Hari ini, {todayLabel}</Text>
 
-        <View style={styles.searchWrapper}>
-          <Text style={styles.searchIcon}>◎</Text>
-          <TextInput
-            value={query}
-            onChangeText={setQuery}
-            placeholder="Cari SKT..."
-            placeholderTextColor="#98A2B3"
-            style={styles.searchInput}
-          />
+        <View style={styles.dateFilterContainer}>
+          <TouchableOpacity
+            style={styles.dateFilterButton}
+            onPress={() => setIsDateMenuOpen((v) => !v)}
+            activeOpacity={0.7}
+            accessibilityLabel="Filter by date"
+          >
+            <View style={styles.dateFilterLeft}>
+              <Icon name="calendar-alt" size={14} color="#2F5FD1" solid />
+              <Text style={styles.dateFilterText}>{formatShortDate(selectedDate)}</Text>
+            </View>
+            <Icon name={isDateMenuOpen ? 'chevron-up' : 'chevron-down'} size={12} color="#667085" solid />
+          </TouchableOpacity>
+
+          {isDateMenuOpen && (
+            <View style={styles.dateFilterMenu}>
+              {dateOptions.map((d) => {
+                const active = isSameDay(d, selectedDate);
+                return (
+                  <TouchableOpacity
+                    key={d.toISOString()}
+                    style={[styles.dateFilterOption, active && styles.dateFilterOptionActive]}
+                    onPress={() => {
+                      setSelectedDate(d);
+                      setIsDateMenuOpen(false);
+                    }}
+                    activeOpacity={0.7}
+                  >
+                    <Text
+                      style={[
+                        styles.dateFilterOptionText,
+                        active && styles.dateFilterOptionTextActive,
+                      ]}
+                    >
+                      {formatShortDate(d)}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          )}
         </View>
 
         {isOffline && (
@@ -348,7 +383,7 @@ export default function SKTHeaderDashboardScreen() {
 
         {isLoading ? (
           <ActivityIndicator style={styles.loader} color="#2F5FD1" />
-        ) : error && filteredItems.length === 0 ? (
+        ) : error && items.length === 0 ? (
           <Text style={styles.errorText}>{error}</Text>
         ) : (
           <FlatList
@@ -358,7 +393,7 @@ export default function SKTHeaderDashboardScreen() {
             columnWrapperStyle={styles.row}
             contentContainerStyle={styles.listContent}
             refreshControl={
-              <RefreshControl refreshing={isRefreshing} onRefresh={() => loadData(true)} />
+              <RefreshControl refreshing={isRefreshing} onRefresh={() => loadFromCacheOnly(true)} />
             }
             ListEmptyComponent={
               <Text style={styles.emptyText}>No SKT records found.</Text>
@@ -483,17 +518,37 @@ const styles = StyleSheet.create({
     maxWidth: '55%',
   },
   subheading: { fontSize: 13, color: '#667085', marginTop: 4, marginBottom: 16 },
-  searchWrapper: {
+  dateFilterContainer: { position: 'relative', zIndex: 10, marginBottom: 12 },
+  dateFilterButton: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-between',
     backgroundColor: '#EEF1F5',
-    borderRadius: 24,
+    borderRadius: 12,
     paddingHorizontal: 16,
-    paddingVertical: 10,
-    marginBottom: 12,
+    paddingVertical: 12,
   },
-  searchIcon: { color: '#2F5FD1', marginRight: 8, fontSize: 15 },
-  searchInput: { flex: 1, fontSize: 14, color: '#101828', padding: 0 },
+  dateFilterLeft: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  dateFilterText: { fontSize: 14, fontWeight: '600', color: '#101828' },
+  dateFilterMenu: {
+    position: 'absolute',
+    top: '100%',
+    left: 0,
+    right: 0,
+    marginTop: 4,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 12,
+    paddingVertical: 4,
+    shadowColor: '#101828',
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 4,
+  },
+  dateFilterOption: { paddingHorizontal: 16, paddingVertical: 12 },
+  dateFilterOptionActive: { backgroundColor: '#EEF1F5' },
+  dateFilterOptionText: { fontSize: 14, color: '#344054' },
+  dateFilterOptionTextActive: { color: '#2F5FD1', fontWeight: '700' },
   offlineNote: {
     color: '#B54708',
     fontSize: 12,

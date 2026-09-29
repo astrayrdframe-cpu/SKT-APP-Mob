@@ -20,7 +20,7 @@ import { useNavigation, useRoute, useIsFocused, RouteProp } from '@react-navigat
 import { useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
 import { CodeScanner, Barcode } from 'react-native-vision-camera-barcode-scanner';
 import type { RootStackParamList } from '../../navigation/mainNavigation';
-import { findTestTempRowByCode } from '../../../services/API/sktApi';
+import { findTestTempRowByCode, resolveBarcodeTray } from '../../../services/API/sktApi';
 import { TestTempRow } from '../../../services/skt';
 
 type ScanState = 'no-permission' | 'no-device' | 'idle' | 'verifying' | 'success' | 'not-found';
@@ -69,6 +69,13 @@ export default function BarcodeTrayScanScreen() {
   const [scanState, setScanState] = useState<ScanState>(hasPermission ? 'idle' : 'no-permission');
   const [scannedCode, setScannedCode] = useState<string | null>(null);
   const [matchedTestTemp, setMatchedTestTemp] = useState<TestTempRow | null>(null);
+  // Fetched separately from the test_temp match above, and allowed to fail
+  // or still be in flight while `success` is already showing — the batang
+  // count is just a preview here (see resolveBarcodeTray in sktApi.ts,
+  // called again for real once TambahSetoranModal picks up this scan), so
+  // a slow/failed lookup shouldn't block or revert an otherwise-recognized
+  // barcode.
+  const [resolvedBatang, setResolvedBatang] = useState<number | null>(null);
 
   // Bumped on every "Coba Lagi" tap to force CodeScannerErrorBoundary to
   // fully remount and to restart the no-device grace timer below.
@@ -121,15 +128,25 @@ export default function BarcodeTrayScanScreen() {
   const handleScannedCode = useCallback(async (code: string) => {
     setScannedCode(code);
     setScanState('verifying');
+    setResolvedBatang(null);
 
     try {
       const match = await findTestTempRowByCode(code);
-      if (match) {
-        setMatchedTestTemp(match);
-        setScanState('success');
-      } else {
+      if (!match) {
         setMatchedTestTemp(null);
         setScanState('not-found');
+        return;
+      }
+      setMatchedTestTemp(match);
+      setScanState('success');
+
+      // Best-effort quantity preview — a failure here doesn't undo the
+      // "success" state above, it just leaves the quantity line blank.
+      try {
+        const tray = await resolveBarcodeTray(code);
+        setResolvedBatang(tray.batang);
+      } catch {
+        setResolvedBatang(null);
       }
     } catch {
       setMatchedTestTemp(null);
@@ -150,6 +167,7 @@ export default function BarcodeTrayScanScreen() {
     isProcessingRef.current = false;
     setScannedCode(null);
     setMatchedTestTemp(null);
+    setResolvedBatang(null);
     setScanState('idle');
   };
 
@@ -273,7 +291,10 @@ export default function BarcodeTrayScanScreen() {
             </View>
             <Text style={styles.successTitle}>Barcode Ditemukan</Text>
             <Text style={styles.workerName}>{scannedCode}</Text>
-            <Text style={styles.workerMeta}>Cocok dengan "{matchedTestTemp.nameTest}"</Text>
+            <Text style={styles.workerMeta}>{matchedTestTemp.nameTest}</Text>
+            <Text style={styles.workerQuantity}>
+              {resolvedBatang != null ? `${resolvedBatang} Batang` : 'Memuat jumlah...'}
+            </Text>
             <TouchableOpacity
               style={[styles.primaryButton, styles.fullWidthButton]}
               onPress={handleGunakan}
@@ -389,7 +410,15 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   workerName: { fontSize: 13, fontWeight: '600', color: '#344054', textAlign: 'center' },
-  workerMeta: { fontSize: 11, color: '#667085', textAlign: 'center', marginTop: 2, marginBottom: 16 },
+  workerMeta: { fontSize: 11, color: '#667085', textAlign: 'center', marginTop: 2 },
+  workerQuantity: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#2F5FD1',
+    textAlign: 'center',
+    marginTop: 2,
+    marginBottom: 16,
+  },
   errorIconCircle: {
     alignSelf: 'center',
     width: 48,
