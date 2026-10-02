@@ -23,6 +23,8 @@ import {
 import { SKTDetail, SetoranWorker } from '../../../services/skt';
 import { saveToCache, loadFromCache, sktDetailCacheKey } from '../../../services/Offline/persistence';
 import { useOffline } from '../../../context/OfflineContext';
+import { useAuthStore } from '../../../store/authStore';
+import { canAccessHeader } from '../../../utils/accessControl';
 import DetailMejaModal from '../components/DetailMejaModal';
 import TambahPekerjaModal from '../components/TambahPekerjaModal';
 import TambahSetoranModal from '../setoran/TambahSetoranModal';
@@ -70,6 +72,7 @@ export default function SKTHeaderDetailScreen() {
   const route = useRoute<DetailRouteProp>();
   const { id, preview } = route.params;
   const { isOffline } = useOffline();
+  const user = useAuthStore((state) => state.user);
 
   const [detail, setDetail] = useState<SKTDetail | null>(
     preview ? { ...preview, totalSetoran: 0, totalSetoranUnit: 'btg' } : null
@@ -499,6 +502,29 @@ export default function SKTHeaderDetailScreen() {
   }
 
   const item = detail!;
+
+  // Belt-and-suspenders alongside the Dashboard list's own filtering (see
+  // accessibleItems in SKTHeaderDashboardScreen.tsx) — this screen can also
+  // be reached straight off a navigation param (e.g. a stale `preview`, or
+  // a deep link), which wouldn't have gone through that list filter. See
+  // canAccessHeader in utils/accessControl.ts for the actual rule.
+  if (!canAccessHeader(user?.skt_template_header_mk_id, item)) {
+    return (
+      <View style={styles.screen}>
+        <View style={styles.topBar}>
+          <TouchableOpacity onPress={() => navigation.goBack()} accessibilityLabel="Go back">
+            <Text style={styles.backIcon}>←</Text>
+          </TouchableOpacity>
+          <Text style={styles.topBarTitle}>SKT Header</Text>
+          <View style={{ width: 20 }} />
+        </View>
+        <Text style={styles.errorText}>
+          Anda tidak memiliki akses untuk melihat data SKT Header ini.
+        </Text>
+      </View>
+    );
+  }
+
   const formattedDate = item.tanggal
     ? new Date(item.tanggal).toLocaleDateString('id-ID', {
         day: '2-digit',
@@ -506,6 +532,13 @@ export default function SKTHeaderDetailScreen() {
         year: 'numeric',
       })
     : '—';
+  // This header's OWN Brak name — skt_header's nama_brak column (see
+  // SKTHeaderItem.brakName in services/skt.ts), not the logged-in user's
+  // own nama_brak from /auth/login, which is a per-account access marker
+  // (can read "ALL" for an account with blanket access) rather than this
+  // specific header's actual Brak. Falls back to the numeric id only if
+  // brakName is ever empty.
+  const brakLabel = item.brakName || `Brak ${item.brakId}`;
 
   return (
     <View style={styles.screen}>
@@ -532,7 +565,7 @@ export default function SKTHeaderDetailScreen() {
             </View>
             <View style={styles.infoCol}>
               <Text style={styles.infoLabel}>Brak</Text>
-              <Text style={styles.infoValue}>#{item.brakId}</Text>
+              <Text style={styles.infoValue}>{brakLabel}</Text>
             </View>
             <View style={styles.infoCol}>
               <Text style={styles.infoLabel}>Jenis</Text>
@@ -680,7 +713,7 @@ export default function SKTHeaderDetailScreen() {
       <DetailMejaModal
         visible={showDetailMeja}
         onClose={() => setShowDetailMeja(false)}
-        brakLabel={`Brak ${item.brakId}`}
+        brakLabel={brakLabel}
         tanggal={formattedDate}
         mejaGroups={mejaGroups}
         deletingPekerjaId={deletingPekerjaId}
@@ -732,7 +765,7 @@ export default function SKTHeaderDetailScreen() {
         sktHeaderId={item.id}
         brand={item.brand}
         jenisLabel={item.jenisLabel}
-        brakLabel={`Brak ${item.brakId}`}
+        brakLabel={brakLabel}
         // Editing an existing submission keeps it pinned to its own meja —
         // a fresh add starts with no meja at all, and no candidate list
         // pre-filtered to one either (see TambahSetoranModal's mejaGroups

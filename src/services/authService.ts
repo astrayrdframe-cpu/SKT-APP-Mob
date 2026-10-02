@@ -15,6 +15,12 @@ interface LoginResponse {
     username: string;
     nama_brak: string;
     expired_date: string;
+    // Not actually returned by the endpoint yet (see
+    // ISktUser.skt_template_header_mk_id in interface/userInterface.ts) —
+    // typed here, optional, so Login.tsx can already thread it through to
+    // the stored session the moment the backend starts sending it, without
+    // another round of changes here.
+    skt_template_header_mk_id?: number | null;
   };
 }
 

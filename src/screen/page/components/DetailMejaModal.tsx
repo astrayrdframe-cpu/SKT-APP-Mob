@@ -13,7 +13,7 @@ import { MejaGroup } from '../../../services/pekerja';
 interface DetailMejaModalProps {
   visible: boolean;
   onClose: () => void;
-  brakLabel: string; // e.g. "Brak 2"
+  brakLabel: string; // the Brak's actual name (nama_brak), e.g. "Djinggo" — NOT prefixed with "Brak" (this component adds that itself below)
   tanggal: string; // e.g. "13 Juli 2026"
   mejaGroups: MejaGroup[];
   deletingPekerjaId?: number | null; // shows a spinner on this row's Delete button while its request is in flight
@@ -71,7 +71,7 @@ export default function DetailMejaModal({
               <View>
                 <Text style={styles.title}>Detail Meja</Text>
                 <Text style={styles.subtitle}>
-                  {brakLabel} - {tanggal}
+                  Brak {brakLabel} - {tanggal}
                 </Text>
               </View>
               <TouchableOpacity onPress={onClose} accessibilityLabel="Close">

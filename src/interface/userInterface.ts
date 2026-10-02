@@ -62,4 +62,12 @@ export interface IUser {
 export interface ISktUser {
   username: string;
   nama_brak: string;
+  // Which MK ("Mandor Kepala"?) this account belongs to — matched against
+  // SKTHeaderItem.templateHeaderMkId (services/skt.ts) to decide which SKT
+  // Header records the account can see (see canAccessHeader in
+  // utils/accessControl.ts). ASSUMPTION: the login endpoint doesn't
+  // actually send this field yet, so every real session currently has it
+  // undefined — until that changes, every account is treated as a super
+  // user with unrestricted access, by design (see canAccessHeader).
+  skt_template_header_mk_id?: number | null;
 }

@@ -47,9 +47,22 @@ interface RawHeaderRow {
   id: number;
   skt_brand_id: number;
   skt_master_brak_id: number;
+  // The Brak's actual name, e.g. "Djinggo" — confirmed present directly
+  // on skt_header itself (sample response: {"skt_master_brak_id":1,
+  // "nama_brak":"Djinggo", ...}), despite an earlier, now-wrong assumption
+  // that no such field existed here. This is what the UI displays for
+  // "Brak" (see SKTHeaderItem.brakName in skt.ts) — NOT the logged-in
+  // user's own nama_brak from /auth/login, which is a per-account access
+  // marker (can be "ALL" for an account with blanket access) rather than
+  // a specific header's actual Brak.
+  nama_brak: string;
   skt_jenis_garapan_id: string;
   header_date: string;
   jumlah_garapan_lembur: number;
+  // See SKTHeaderItem.templateHeaderMkId in skt.ts — captured here so it's
+  // on hand once login (authService.ts) starts returning the current
+  // user's own MK id and a visibility filter can compare the two.
+  skt_template_header_mk_id: number | null;
 }
 
 interface RawViewRow {
@@ -154,14 +167,72 @@ export async function fetchSktHeaderList(): Promise<SKTHeaderItem[]> {
     return {
       id: header.id,
       brakId: header.skt_master_brak_id,
+      brakName: header.nama_brak,
       brandId: header.skt_brand_id,
       brand,
       jenisGarapanId: header.skt_jenis_garapan_id,
       jenisLabel: deriveJenisLabel(header.skt_jenis_garapan_id, header.jumlah_garapan_lembur),
       tanggal: header.header_date,
       jumlahMeja,
+      templateHeaderMkId: header.skt_template_header_mk_id,
     };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Push Data — POST the locally cached SKT headers back to skt_header
+// ---------------------------------------------------------------------------
+//
+// Dashboard's "Push Data" (Sinkronisasi Data → confirmed) sends every
+// currently-cached header up to ORDS via POST, one row per call — the same
+// SKT_HEADER_ENDPOINT this file already GETs from, just the other verb.
+//
+// ASSUMPTION: there's no local write-queue / dirty-tracking yet (nothing in
+// this app currently marks a header as "changed since last sync"), so this
+// pushes EVERY cached header indiscriminately, not just ones with real
+// local edits — confirm with the backend whether re-POSTing an unchanged
+// `id` is a safe no-op/upsert there, or whether this needs to be scoped
+// down to an actual changed-rows queue later. ALSO ASSUMPTION: the body
+// mirrors RawHeaderRow's columns (see fetchSktHeaderRows above) since
+// that's the only shape confirmed from the GET side; `jumlah_garapan_lembur`
+// has no equivalent on the cached SKTHeaderItem (only the already-derived
+// jenisLabel survives locally), so it's sent as 0 — adjust once the real
+// create/update contract is confirmed.
+async function pushSktHeaderRow(item: SKTHeaderItem): Promise<void> {
+  const response = await fetch(SKT_HEADER_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      id: item.id,
+      skt_brand_id: item.brandId,
+      skt_master_brak_id: item.brakId,
+      skt_jenis_garapan_id: item.jenisGarapanId,
+      header_date: item.tanggal,
+      jumlah_garapan_lembur: 0,
+      skt_template_header_mk_id: item.templateHeaderMkId,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Gagal push skt_header id=${item.id} (status ${response.status})`);
+  }
+}
+
+/**
+ * Entry point Dashboard's "Push Data" confirmation should call. Pushes
+ * every item in parallel and never throws for an individual failure — it
+ * reports back how many of each so the caller can tell the admin "3 of 5
+ * failed" rather than losing that detail to a single thrown error.
+ */
+export async function pushAllSktHeaders(
+  items: SKTHeaderItem[]
+): Promise<{ succeeded: number; failed: number }> {
+  const results = await Promise.allSettled(items.map((item) => pushSktHeaderRow(item)));
+  const failed = results.filter((r) => r.status === 'rejected');
+  failed.forEach((r) => {
+    if (r.status === 'rejected') console.warn('Push Data: one skt_header row failed:', r.reason);
+  });
+  return { succeeded: results.length - failed.length, failed: failed.length };
 }
 
 /**
@@ -185,6 +256,7 @@ function buildDetailAndWorkers(
   const detail: SKTDetail = {
     id: header.id,
     brakId: header.skt_master_brak_id,
+    brakName: header.nama_brak,
     brandId: header.skt_brand_id,
     brand,
     jenisGarapanId: header.skt_jenis_garapan_id,
@@ -193,6 +265,7 @@ function buildDetailAndWorkers(
     jumlahMeja,
     totalSetoran,
     totalSetoranUnit: 'btg', // ASSUMPTION — no unit field in the schema
+    templateHeaderMkId: header.skt_template_header_mk_id,
   };
 
   const workers: SetoranWorker[] = injectDualRoleTestRow(

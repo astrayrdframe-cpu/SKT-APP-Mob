@@ -12,11 +12,12 @@ import {
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import Icon from 'react-native-vector-icons/FontAwesome5';
-import { fetchAllSktDetails, fetchTestTempData } from '../../../services/API/sktApi';
+import { fetchAllSktDetails, fetchTestTempData, pushAllSktHeaders } from '../../../services/API/sktApi';
 import { fetchMasterPekerja } from '../../../services/API/pekerjaApi';
 import { SKTHeaderItem, SKTDetail, SetoranWorker, TestTempRow } from '../../../services/skt';
 import { MasterPekerja } from '../../../services/pekerja';
 import { dedupeById } from '../../../utils/dedupe';
+import { canAccessHeader } from '../../../utils/accessControl';
 import {
   saveToCache,
   loadFromCache,
@@ -116,9 +117,18 @@ export default function SKTHeaderDashboardScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [minuteTick]);
 
+  // Visibility by skt_template_header_mk_id (see canAccessHeader in
+  // utils/accessControl.ts) — applied before the date filter so a header
+  // the account can't see never even reaches the date-filtered list, let
+  // alone the FlatList below.
+  const accessibleItems = useMemo(
+    () => items.filter((item) => canAccessHeader(user?.skt_template_header_mk_id, item)),
+    [items, user]
+  );
+
   const filteredItems = useMemo(
-    () => items.filter((item) => isSameDay(new Date(item.tanggal), selectedDate)),
-    [items, selectedDate]
+    () => accessibleItems.filter((item) => isSameDay(new Date(item.tanggal), selectedDate)),
+    [accessibleItems, selectedDate]
   );
 
   // Picking Get Data / Push Data in the sync sheet doesn't run the action
@@ -142,9 +152,9 @@ export default function SKTHeaderDashboardScreen() {
     setPendingSyncAction(null);
     if (action === 'get') {
       syncAllFromOrds();
+    } else if (action === 'push') {
+      pushAllDataToOrds();
     }
-    // 'push': no local write-queue exists yet to push, so this is a no-op
-    // for now — hook up once that's in place.
   };
 
   const handleLogout = () => {
@@ -175,6 +185,32 @@ export default function SKTHeaderDashboardScreen() {
     loadFromCacheOnly();
   }, [loadFromCacheOnly]);
 
+  // skt_master_pekerja — the worker directory the badge scanner
+  // (AbsensiScanScreenCamera, via findMasterPekerjaByNik in pekerjaApi.ts)
+  // matches a scanned NIK against. Always pulled on every "Get Data" tap,
+  // independently of the SKT header/detail sync below (see syncAllFromOrds
+  // calling this before its own try block, not from inside it) — nested
+  // inside that sync's try, a failure fetching skt header/detail (e.g.
+  // offline mid-sync) used to skip this fetch entirely too, silently
+  // leaving the pekerja directory stale even though it has nothing to do
+  // with SKT headers. Wholesale-replaces the cache with the fresh fetch
+  // rather than merging — fetchMasterPekerja already collapses any
+  // same-(nomor_absen, nama_pekerja, nik) rows down to one (see
+  // fetchMasterPekerja in pekerjaApi.ts), so a full replace can't
+  // reintroduce the same person twice even if skt_master_pekerja itself
+  // has stray duplicate rows for them under different ids.
+  const refreshMasterPekerja = useCallback(async () => {
+    try {
+      const previousMasterPekerja = await loadFromCache<MasterPekerja[]>(CACHE_KEYS.MASTER_PEKERJA);
+      const masterPekerjaRows = await fetchMasterPekerja();
+      if (!isSameCachedValue(previousMasterPekerja, masterPekerjaRows)) {
+        await saveToCache(CACHE_KEYS.MASTER_PEKERJA, masterPekerjaRows);
+      }
+    } catch (masterPekerjaError) {
+      console.warn('Failed to refresh skt_master_pekerja:', masterPekerjaError);
+    }
+  }, []);
+
   // "Get Data" (Sinkronisasi Data → confirmed) — a full resync from ORDS,
   // not just the summary list loadData() pulls for pull-to-refresh. Fetches
   // every header's detail + worker rows in one pass via fetchAllSktDetails
@@ -187,6 +223,12 @@ export default function SKTHeaderDashboardScreen() {
   const syncAllFromOrds = useCallback(async () => {
     setIsRefreshing(true);
     setError(null);
+
+    // Started before the try block below, not inside it — this must run
+    // (and get a chance to finish) regardless of whether the SKT
+    // header/detail sync below succeeds or throws.
+    const masterPekerjaPromise = refreshMasterPekerja();
+
     try {
       // Deliberately NOT filtered by isUsableHeader — this needs to be the
       // raw previously-cached list so the staleIds sweep below (which diffs
@@ -255,23 +297,6 @@ export default function SKTHeaderDashboardScreen() {
       } catch (testTempError) {
         console.warn('Failed to refresh skt/test_temp:', testTempError);
       }
-
-      // skt_master_pekerja — the worker directory the badge scanner
-      // (AbsensiScanScreenCamera, via findMasterPekerjaByNik in
-      // pekerjaApi.ts) matches a scanned NIK against. Cached here, same
-      // as test_temp above, so that scan never needs a live GET of its
-      // own — its own try/catch for the same reason.
-      try {
-        const previousMasterPekerja = await loadFromCache<MasterPekerja[]>(
-          CACHE_KEYS.MASTER_PEKERJA
-        );
-        const masterPekerjaRows = dedupeById(await fetchMasterPekerja(), (r) => r.id);
-        if (!isSameCachedValue(previousMasterPekerja, masterPekerjaRows)) {
-          await saveToCache(CACHE_KEYS.MASTER_PEKERJA, masterPekerjaRows);
-        }
-      } catch (masterPekerjaError) {
-        console.warn('Failed to refresh skt_master_pekerja:', masterPekerjaError);
-      }
     } catch {
       // Fall back to the last cached list — likely offline, or the
       // endpoint is temporarily unreachable. Filtered and re-saved so a
@@ -287,10 +312,43 @@ export default function SKTHeaderDashboardScreen() {
         setError('Unable to load SKT data. Tap refresh to try again.');
       }
     } finally {
+      await masterPekerjaPromise;
+      setIsRefreshing(false);
+    }
+  }, [refreshMasterPekerja]);
+
+  // "Push Data" (Sinkronisasi Data → confirmed) — POSTs every locally
+  // cached header back to skt_header (see pushAllSktHeaders in sktApi.ts).
+  // No local write-queue exists yet (nothing here tracks which headers
+  // actually changed since the last sync), so this pushes the whole
+  // cached list indiscriminately — see pushAllSktHeaders' own comment for
+  // that caveat. Reports a partial-failure count rather than a flat
+  // success/error, since some rows succeeding and others failing is the
+  // expected shape of a multi-row push, not an edge case.
+  const pushAllDataToOrds = useCallback(async () => {
+    setIsRefreshing(true);
+    setError(null);
+    try {
+      const cached = (await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST)) ?? [];
+      if (cached.length === 0) {
+        Alert.alert('Tidak Ada Data', 'Tidak ada data lokal untuk dikirim ke server.');
+        return;
+      }
+      const { succeeded, failed } = await pushAllSktHeaders(cached);
+      if (failed > 0) {
+        Alert.alert(
+          'Push Data Selesai Sebagian',
+          `${succeeded} data berhasil dikirim, ${failed} data gagal dikirim ke server.`
+        );
+      } else {
+        Alert.alert('Push Data Berhasil', `${succeeded} data berhasil dikirim ke server.`);
+      }
+    } catch {
+      Alert.alert('Gagal Push Data', 'Terjadi kesalahan saat mengirim data ke server. Silakan coba lagi.');
+    } finally {
       setIsRefreshing(false);
     }
   }, []);
-
 
   const todayLabel = new Date().toLocaleDateString('id-ID', {
     day: '2-digit',
@@ -414,7 +472,13 @@ export default function SKTHeaderDashboardScreen() {
 
                 <View style={styles.cardRow}>
                   <Text style={styles.cardValueBold}>{item.jumlahMeja} Meja</Text>
-                  <Text style={styles.cardValueBold}>Brak #{item.brakId}</Text>
+                  {/* This header's OWN Brak name — skt_header's nama_brak
+                      column (see SKTHeaderItem.brakName in services/skt.ts),
+                      not the logged-in user's own nama_brak from
+                      /auth/login, which is a per-account access marker (can
+                      read "ALL" for an account with blanket access) rather
+                      than any specific header's actual Brak. */}
+                  <Text style={styles.cardValueBold}>{item.brakName || `Brak #${item.brakId}`}</Text>
                 </View>
 
                 <View style={styles.cardDivider} />

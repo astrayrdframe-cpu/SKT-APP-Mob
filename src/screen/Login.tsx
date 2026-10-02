@@ -75,6 +75,11 @@ export default function LoginScreen() {
             user: {
                 username: 'dev-mock-admin',
                 nama_brak: 'Mock Brak (Dev Only)',
+                // No MK id = super user (see canAccessHeader in
+                // utils/accessControl.ts) — the dev mock session sees
+                // every SKT Header, which is what you want when poking
+                // around offline/off-network.
+                skt_template_header_mk_id: null,
             },
         });
     };
@@ -113,6 +118,11 @@ export default function LoginScreen() {
                 user: {
                     username: response.data.username,
                     nama_brak: response.data.nama_brak,
+                    // Not sent by the endpoint yet (see LoginResponse in
+                    // authService.ts) — undefined here is correctly read
+                    // as "super user" by canAccessHeader until that
+                    // changes, not a bug.
+                    skt_template_header_mk_id: response.data.skt_template_header_mk_id,
                 },
             });
 

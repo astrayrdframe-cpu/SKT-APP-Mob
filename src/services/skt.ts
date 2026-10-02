@@ -1,15 +1,30 @@
 // Dashboard-list row. brandId comes from skt_header; brand (the name)
-// comes from skt_view's nama_brand for the same skt_header_id. brakId
-// still has no name lookup yet (no equivalent "nama_brak" field seen).
+// comes from skt_view's nama_brand for the same skt_header_id.
 export interface SKTHeaderItem {
   id: number;
-  brakId: number;
+  brakId: number; // skt_master_brak_id — raw id, kept for cases that still need it (e.g. scoping a master pekerja search, see TambahPekerjaModal's brakId prop)
+  // The Brak's actual name — from skt_header's own nama_brak column (e.g.
+  // "Djinggo"), NOT the logged-in user's nama_brak from /auth/login (see
+  // ISktUser in interface/userInterface.ts). That login field is a
+  // per-account access marker — it can be "ALL" for an account with
+  // blanket access across every Brak — and isn't this header's own Brak,
+  // which is why the UI must read it per-record here, not off the user.
+  brakName: string;
   brandId: number;
   brand: string; // from skt_view's nama_brand
   jenisGarapanId: string; // "1" | "2" (raw code from the API)
   jenisLabel: 'Biasa' | 'Lembur' | string; // derived label for display
   tanggal: string; // from header_date
   jumlahMeja: number; // sourced from skt_view, not present on skt_header
+  // skt_template_header_mk_id from skt_header — identifies which MK
+  // ("Mandor Kepala"?) this header belongs to. Not used for anything yet:
+  // the /auth/login response (authService.ts) doesn't hand back the
+  // logged-in user's own MK id, so there's nothing to compare this
+  // against. Captured now purely so it's available once login is updated
+  // to include it — the intent is a visibility filter where a user can
+  // only see headers whose skt_template_header_mk_id matches their own.
+  // ASSUMPTION: nullable until a real row with this column set is seen.
+  templateHeaderMkId: number | null;
 }
 
 // Full detail for one header, plus the aggregated total across all its

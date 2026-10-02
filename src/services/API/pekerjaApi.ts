@@ -66,7 +66,15 @@ export async function fetchMasterPekerja(
   // utils/dedupe.ts for why (a dirty view/join, or a pagination overlap,
   // shouldn't surface downstream as a duplicate name in the "Pilih
   // Pekerja" combobox or CACHE_KEYS.MASTER_PEKERJA).
-  const rows = dedupeById(rowsRaw, (r) => r.id);
+  const byId = dedupeById(rowsRaw, (r) => r.id);
+  // Second pass, keyed on the same "nomor_absen - nama_pekerja - nik"
+  // identity used everywhere else (buildDetailPekerja) rather than the raw
+  // row id — catches the same PERSON showing up twice in
+  // skt_master_pekerja under two different ids (e.g. re-entered rather
+  // than corrected), which the id-only pass above can't see since the ids
+  // genuinely differ. First occurrence wins, same "first wins" rule as
+  // dedupeById.
+  const rows = dedupeById(byId, (r) => buildDetailPekerja(r.nomor_absen, r.nama_pekerja, r.nik));
 
   return rows
     .filter((row) => options?.includeInactive || row.active === 1)
