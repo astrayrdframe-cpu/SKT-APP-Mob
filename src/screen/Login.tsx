@@ -74,12 +74,15 @@ export default function LoginScreen() {
             expiry: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
             user: {
                 username: 'dev-mock-admin',
+                role: 'ADMIN',
                 nama_brak: 'Mock Brak (Dev Only)',
-                // No MK id = super user (see canAccessHeader in
+                // role ADMIN = super user (see isSuperUser in
                 // utils/accessControl.ts) — the dev mock session sees
-                // every SKT Header, which is what you want when poking
-                // around offline/off-network.
-                skt_template_header_mk_id: null,
+                // every SKT Header and every meja, which is what you want
+                // when poking around offline/off-network.
+                brak_id: null,
+                mk_id: null,
+                must_change_password: 0,
             },
         });
     };
@@ -117,19 +120,24 @@ export default function LoginScreen() {
                 expiry: response.data.expired_date,
                 user: {
                     username: response.data.username,
+                    role: response.data.role,
                     nama_brak: response.data.nama_brak,
-                    // Not sent by the endpoint yet (see LoginResponse in
-                    // authService.ts) — undefined here is correctly read
-                    // as "super user" by canAccessHeader until that
-                    // changes, not a bug.
-                    skt_template_header_mk_id: response.data.skt_template_header_mk_id,
+                    brak_id: response.data.brak_id,
+                    // null for ADMIN logins (ADMIN rows never set mk_id) —
+                    // harmless, since role ADMIN skips the MK filter.
+                    mk_id: response.data.mk_id,
+                    must_change_password: response.data.must_change_password,
                 },
             });
 
             
         } catch (error: any) {
             Alert.alert('Login Failed', error.message || 'An error occurred during login');
-            console.error('Login error:', error);
+            // warn, not error — a rejected login (bad/inactive username,
+            // wrong password) is expected user input, already surfaced via
+            // the Alert above; console.error here would pop RN's LogBox
+            // redbox for something that isn't an app crash.
+            console.warn('Login error:', error);
         } finally {
             setLoading(false);
         }

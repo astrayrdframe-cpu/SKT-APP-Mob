@@ -3,9 +3,11 @@ import AsyncStorage from '@react-native-async-storage/async-storage'; // Use the
 import axiosInstance from '../config/axiosInstance';
 import Toast from 'react-native-toast-message';
 
-// Matches what the ORDS `/auth/login` endpoint actually returns, e.g.:
+// Matches what the ORDS `/auth/login` endpoint's PL/SQL actually returns:
 // { "status": "success", "message": "Login berhasil",
-//   "data": { "token": "...", "username": "...", "nama_brak": "...",
+//   "data": { "token": "...", "username": "...", "role": "ADMIN" | "MK",
+//              "nama_brak": "...", "mk_id": number | null,
+//              "brak_id": number | null, "must_change_password": 0 | 1,
 //              "expired_date": "2026-08-05T16:07:24" } }
 interface LoginResponse {
   status: 'success' | 'error' | string;
@@ -13,14 +15,12 @@ interface LoginResponse {
   data: {
     token: string;
     username: string;
+    role: 'ADMIN' | 'MK' | string;
     nama_brak: string;
+    mk_id: number | null;
+    brak_id: number | null;
+    must_change_password: number;
     expired_date: string;
-    // Not actually returned by the endpoint yet (see
-    // ISktUser.skt_template_header_mk_id in interface/userInterface.ts) —
-    // typed here, optional, so Login.tsx can already thread it through to
-    // the stored session the moment the backend starts sending it, without
-    // another round of changes here.
-    skt_template_header_mk_id?: number | null;
   };
 }
 

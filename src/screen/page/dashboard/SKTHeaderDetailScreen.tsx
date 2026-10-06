@@ -24,7 +24,7 @@ import { SKTDetail, SetoranWorker } from '../../../services/skt';
 import { saveToCache, loadFromCache, sktDetailCacheKey } from '../../../services/Offline/persistence';
 import { useOffline } from '../../../context/OfflineContext';
 import { useAuthStore } from '../../../store/authStore';
-import { canAccessHeader } from '../../../utils/accessControl';
+import { canAccessHeader, getVisibleMejaNumbers } from '../../../utils/accessControl';
 import DetailMejaModal from '../components/DetailMejaModal';
 import TambahPekerjaModal from '../components/TambahPekerjaModal';
 import TambahSetoranModal from '../setoran/TambahSetoranModal';
@@ -160,18 +160,41 @@ export default function SKTHeaderDetailScreen() {
     [detail, id]
   );
 
-  const mejaTabs = useMemo(() => {
-    const count = detail?.jumlahMeja ?? 0;
-    return ['Semua Meja', ...Array.from({ length: count }, (_, i) => i + 1)] as (
-      | 'Semua Meja'
-      | number
-    )[];
-  }, [detail?.jumlahMeja]);
+  // Per-meja MK scoping (see getVisibleMejaNumbers in
+  // utils/accessControl.ts): an MK login only sees the meja assigned to
+  // its own mk_id; null means a super user who sees every meja. Only the
+  // views below are filtered — `workers` itself stays complete, since it's
+  // what persistWorkers writes back to the shared cache and what
+  // TambahSetoranModal numbers new setoran against.
+  const visibleMeja = useMemo(() => getVisibleMejaNumbers(user, workers), [user, workers]);
+
+  const visibleWorkers = useMemo(
+    () => (visibleMeja ? workers.filter((w) => visibleMeja.has(w.nomorMeja)) : workers),
+    [workers, visibleMeja]
+  );
+
+  // A super user gets 1..jumlahMeja plus any meja that actually has rows —
+  // nomor_meja isn't guaranteed to stay within jumlah_meja (e.g. meja 4 on
+  // a 2-meja header), and those rows must still get a tab.
+  const mejaNumbers = useMemo(() => {
+    const numbers = visibleMeja
+      ? visibleMeja
+      : new Set([
+          ...Array.from({ length: detail?.jumlahMeja ?? 0 }, (_, i) => i + 1),
+          ...workers.map((w) => w.nomorMeja),
+        ]);
+    return Array.from(numbers).sort((a, b) => a - b);
+  }, [visibleMeja, detail?.jumlahMeja, workers]);
+
+  const mejaTabs = useMemo(
+    () => ['Semua Meja', ...mejaNumbers] as ('Semua Meja' | number)[],
+    [mejaNumbers]
+  );
 
   const filteredWorkers = useMemo(() => {
-    if (selectedMeja === 'Semua Meja') return workers;
-    return workers.filter((w) => w.nomorMeja === selectedMeja);
-  }, [workers, selectedMeja]);
+    if (selectedMeja === 'Semua Meja') return visibleWorkers;
+    return visibleWorkers.filter((w) => w.nomorMeja === selectedMeja);
+  }, [visibleWorkers, selectedMeja]);
 
   // List Setoran shows one card per Tambah Setoran submission — Giling
   // paired with its Batil counterpart, not one card per worker row (see
@@ -181,7 +204,7 @@ export default function SKTHeaderDetailScreen() {
   // Real MejaGroup[] derived from `workers` — this is what DetailMejaModal
   // actually needs (it was previously being passed brakId/jumlahMeja/workers,
   // none of which match the component's props, hence the undefined crash).
-  const mejaGroups = useMemo(() => groupWorkersByMeja(workers), [workers]);
+  const mejaGroups = useMemo(() => groupWorkersByMeja(visibleWorkers), [visibleWorkers]);
 
   // The pekerja already sitting in the meja currently being added to —
   // TambahPekerjaModal uses this to compute which role codes are still free.
@@ -508,7 +531,7 @@ export default function SKTHeaderDetailScreen() {
   // be reached straight off a navigation param (e.g. a stale `preview`, or
   // a deep link), which wouldn't have gone through that list filter. See
   // canAccessHeader in utils/accessControl.ts for the actual rule.
-  if (!canAccessHeader(user?.skt_template_header_mk_id, item)) {
+  if (!canAccessHeader(user, item)) {
     return (
       <View style={styles.screen}>
         <View style={styles.topBar}>
@@ -588,7 +611,7 @@ export default function SKTHeaderDetailScreen() {
                 onPress={() => setShowDetailMeja(true)}
                 activeOpacity={0.75}
               >
-                <Text style={styles.statPillText}>{item.jumlahMeja}</Text>
+                <Text style={styles.statPillText}>{mejaNumbers.length}</Text>
                 <Text style={styles.statPillIcon}>👁</Text>
               </TouchableOpacity>
             </View>
@@ -639,7 +662,11 @@ export default function SKTHeaderDetailScreen() {
           <Text style={styles.setoranHeaderText}>List Setoran</Text>
         </View>
 
-        {setoranPairs.length === 0 ? (
+        {visibleMeja && visibleMeja.size === 0 ? (
+          <Text style={styles.emptyText}>
+            Belum ada meja yang ditugaskan kepada Anda di SKT Header ini.
+          </Text>
+        ) : setoranPairs.length === 0 ? (
           <Text style={styles.emptyText}>No setoran entries for this meja yet.</Text>
         ) : (
           <View style={styles.setoranListWrapper}>

@@ -16,14 +16,11 @@ export interface SKTHeaderItem {
   jenisLabel: 'Biasa' | 'Lembur' | string; // derived label for display
   tanggal: string; // from header_date
   jumlahMeja: number; // sourced from skt_view, not present on skt_header
-  // skt_template_header_mk_id from skt_header — identifies which MK
-  // ("Mandor Kepala"?) this header belongs to. Not used for anything yet:
-  // the /auth/login response (authService.ts) doesn't hand back the
-  // logged-in user's own MK id, so there's nothing to compare this
-  // against. Captured now purely so it's available once login is updated
-  // to include it — the intent is a visibility filter where a user can
-  // only see headers whose skt_template_header_mk_id matches their own.
-  // ASSUMPTION: nullable until a real row with this column set is seen.
+  // skt_template_header_mk_id from skt_header — the MK template this
+  // header was built from (one template can be assigned to several MKs,
+  // see skt_header's nama_mk_assigned). Not used for visibility: headers
+  // are scoped by brakId, and meja by skt_view's per-row mk_id (see
+  // utils/accessControl.ts). Kept because the push to skt_header sends it.
   templateHeaderMkId: number | null;
 }
 
@@ -56,6 +53,11 @@ export interface SetoranWorker {
   totalDefect: number; // "Bad"
   jamMasuk: string;
   jamKeluar: string;
+  // skt_view's mk_id — the MK assigned to this row's meja. Drives the
+  // per-meja visibility filter for MK logins (see getVisibleMejaNumbers in
+  // utils/accessControl.ts). Null/undefined for rows the backend hasn't
+  // tagged yet and for rows created locally.
+  mkId?: number | null;
   // This submission's running number for its specific Giling+Batil PAIR —
   // not a meja-wide counter. "Role 1 + Role A" and "Role 1 + Role B" are
   // different pairs (different Batil person) and each counts its own
@@ -153,6 +155,12 @@ export interface MejaSummary {
   setoranCount: number; // total individual entries, i.e. "Y Setoran"
   totalGood: number;
   totalBad: number;
+  totalUpah: number; // sum of `total` wage across this meja's rows
+  // Distinct skt_view mk_id values at this meja — lets SetoranSummaryScreen
+  // apply the same per-meja MK filter as the detail screen (see
+  // getVisibleMejaNumbers in utils/accessControl.ts). Optional so older
+  // cached summaries still load; a missing list just means "no MK".
+  mkIds?: number[];
 }
 
 export interface SetoranSummary {

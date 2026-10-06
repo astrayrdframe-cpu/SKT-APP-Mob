@@ -61,13 +61,25 @@ export interface IUser {
 // callers reading real login responses get accurate field names/types.
 export interface ISktUser {
   username: string;
+  // 'ADMIN' (from skt_akses_admin — no mk_id/brak_id, always super user)
+  // or 'MK' (from skt_mobile_user — scoped to their own mk_id/brak_id).
+  // role === 'ADMIN' is what isSuperUser in utils/accessControl.ts keys
+  // off to skip both the Brak and MK filters.
+  role: 'ADMIN' | 'MK' | string;
   nama_brak: string;
-  // Which MK ("Mandor Kepala"?) this account belongs to — matched against
-  // SKTHeaderItem.templateHeaderMkId (services/skt.ts) to decide which SKT
-  // Header records the account can see (see canAccessHeader in
-  // utils/accessControl.ts). ASSUMPTION: the login endpoint doesn't
-  // actually send this field yet, so every real session currently has it
-  // undefined — until that changes, every account is treated as a super
-  // user with unrestricted access, by design (see canAccessHeader).
-  skt_template_header_mk_id?: number | null;
+  // Numeric id behind nama_brak (skt_master_brak.id via skt_mobile_user.
+  // brak_id) — null for ADMIN logins, which don't join skt_master_brak.
+  // Scopes which SKT Headers the Dashboard lists (see canAccessHeader).
+  brak_id: number | null;
+  // Which MK ("Mandor Kepala") this account is — matched against each
+  // skt_view row's mk_id (SetoranWorker.mkId in services/skt.ts) to decide
+  // which meja inside a header the account can see (see
+  // getVisibleMejaNumbers in utils/accessControl.ts). Headers themselves
+  // are scoped by brak_id above, not by this. null for ADMIN accounts
+  // (super users); an MK account with no mk_id assigned sees no meja.
+  mk_id: number | null;
+  // 1 if this account must change its password before continuing, 0
+  // otherwise. Not currently enforced anywhere in the app — captured so a
+  // forced-change screen can be added later without another login change.
+  must_change_password: number;
 }

@@ -81,6 +81,10 @@ interface RawViewRow {
   created_date: string;
   jam_masuk: string;
   jam_keluar: string;
+  // The MK assigned to this row's meja — what an MK login's mk_id is
+  // matched against to decide which meja it can see (see
+  // getVisibleMejaNumbers in utils/accessControl.ts).
+  mk_id?: number | null;
 }
 
 // Dedup-aware wrappers around fetchAllOrdsRows for skt_header/skt_view —
@@ -94,9 +98,26 @@ async function fetchSktHeaderRows(): Promise<RawHeaderRow[]> {
   return dedupeById(rows, (r) => r.id);
 }
 
-async function fetchSktViewRows(): Promise<RawViewRow[]> {
-  const rows = (await fetchAllOrdsRows(SKT_VIEW_ENDPOINT)) as RawViewRow[];
-  return dedupeById(rows, (r) => r.skt_log_pekerja_id);
+// skt_view only returns rows when given a BRAK_ID query param (exact
+// upper-case name — `brak_id` or no param at all returns nothing), one Brak
+// per call. So this fetches each requested Brak separately, in parallel,
+// and merges them.
+async function fetchSktViewRows(brakIds: number[]): Promise<RawViewRow[]> {
+  const uniqueBrakIds = Array.from(new Set(brakIds));
+  const perBrak = await Promise.all(
+    uniqueBrakIds.map(
+      (brakId) =>
+        fetchAllOrdsRows(`${SKT_VIEW_ENDPOINT}?BRAK_ID=${brakId}`) as Promise<RawViewRow[]>
+    )
+  );
+  return dedupeById(perBrak.flat(), (r) => r.skt_log_pekerja_id);
+}
+
+// Which Braks' skt_view rows to pull: `brakIds` when given (an MK login's
+// own Brak), otherwise every Brak that appears on a fetched header (a
+// super user, who sees them all).
+function resolveBrakIds(headerRows: RawHeaderRow[], brakIds?: number[] | null): number[] {
+  return brakIds ?? headerRows.map((h) => h.skt_master_brak_id);
 }
 
 function deriveJenisLabel(jenisGarapanId: string, jumlahGarapanLembur: number): string {
@@ -153,11 +174,9 @@ function injectDualRoleTestRow(workers: SetoranWorker[]): SetoranWorker[] {
  * only exists on skt_view (repeated per worker row) — so we still need
  * to fetch skt_view to fill that one field in.
  */
-export async function fetchSktHeaderList(): Promise<SKTHeaderItem[]> {
-  const [headerRows, viewRows] = await Promise.all([
-    fetchSktHeaderRows(),
-    fetchSktViewRows(),
-  ]);
+export async function fetchSktHeaderList(brakIds?: number[] | null): Promise<SKTHeaderItem[]> {
+  const headerRows = await fetchSktHeaderRows();
+  const viewRows = await fetchSktViewRows(resolveBrakIds(headerRows, brakIds));
 
   return headerRows.map((header): SKTHeaderItem => {
     const relatedViewRows = viewRows.filter((v) => v.skt_header_id === header.id);
@@ -281,6 +300,7 @@ function buildDetailAndWorkers(
         totalDefect: row.total_defect ?? 0,
         jamMasuk: row.jam_masuk,
         jamKeluar: row.jam_keluar,
+        mkId: row.mk_id ?? null,
       }))
       // Group by meja first, then by kode_setoran ("1","2","3","A","B") within it
       .sort((a, b) => a.nomorMeja - b.nomorMeja || a.kodeSetoran.localeCompare(b.kodeSetoran))
@@ -292,15 +312,12 @@ function buildDetailAndWorkers(
 export async function fetchSktDetail(
   id: string | number
 ): Promise<{ detail: SKTDetail; workers: SetoranWorker[] }> {
-  const [headerRows, viewRows] = await Promise.all([
-    fetchSktHeaderRows(),
-    fetchSktViewRows(),
-  ]);
-
+  const headerRows = await fetchSktHeaderRows();
   const header = headerRows.find((h) => String(h.id) === String(id));
   if (!header) {
     throw new Error(`No skt_header record found for id=${id}`);
   }
+  const viewRows = await fetchSktViewRows([header.skt_master_brak_id]);
 
   return buildDetailAndWorkers(header, viewRows);
 }
@@ -314,13 +331,11 @@ export async function fetchSktDetail(
  * SKTHeaderDetailScreen's loadDetail leaves commented out (see the note
  * there) is effectively done here instead, for every record at once.
  */
-export async function fetchAllSktDetails(): Promise<
+export async function fetchAllSktDetails(brakIds?: number[] | null): Promise<
   Array<{ detail: SKTDetail; workers: SetoranWorker[] }>
 > {
-  const [headerRows, viewRows] = await Promise.all([
-    fetchSktHeaderRows(),
-    fetchSktViewRows(),
-  ]);
+  const headerRows = await fetchSktHeaderRows();
+  const viewRows = await fetchSktViewRows(resolveBrakIds(headerRows, brakIds));
 
   return headerRows.map((header) => buildDetailAndWorkers(header, viewRows));
 }
@@ -428,7 +443,13 @@ function toSlot(rows: RawViewRow[]): PekerjaSlot {
  * pair will show 1-2 rows rather than the 4-row example in the mockup.
  */
 export async function fetchSetoranSummary(id: number): Promise<SetoranSummary> {
-  const viewRows = await fetchSktViewRows();
+  // skt_view is fetched per Brak (see fetchSktViewRows), so look up this
+  // header's own Brak first.
+  const header = (await fetchSktHeaderRows()).find((h) => h.id === id);
+  if (!header) {
+    throw new Error(`No skt_header record found for id=${id}`);
+  }
+  const viewRows = await fetchSktViewRows([header.skt_master_brak_id]);
   const relatedRows = viewRows.filter((v) => v.skt_header_id === id);
 
   const mejaNumbers = Array.from(new Set(relatedRows.map((r) => r.nomor_meja))).sort(
@@ -477,6 +498,10 @@ export async function fetchSetoranSummary(id: number): Promise<SetoranSummary> {
     const totalBad = pairs.reduce((sum, p) => sum + p.totalBad, 0);
     const setoranCount = pairs.reduce((sum, p) => sum + p.entries.length, 0);
 
+    const mkIds = Array.from(
+      new Set(mejaRows.map((r) => r.mk_id).filter((v): v is number => v != null))
+    );
+
     return {
       nomorMeja,
       pairs,
@@ -484,11 +509,13 @@ export async function fetchSetoranSummary(id: number): Promise<SetoranSummary> {
       setoranCount,
       totalGood,
       totalBad,
+      totalUpah: mejaRows.reduce((sum, row) => sum + (row.total ?? 0), 0),
+      mkIds,
     };
   });
 
   const totalSetoran = mejaSummaries.reduce((sum, m) => sum + m.totalGood, 0);
-  const totalUpah = relatedRows.reduce((sum, row) => sum + (row.total ?? 0), 0);
+  const totalUpah = mejaSummaries.reduce((sum, m) => sum + m.totalUpah, 0);
 
   return { headerId: id, totalSetoran, totalUpah, mejaSummaries };
 }

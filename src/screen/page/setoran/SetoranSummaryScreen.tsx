@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -15,6 +15,8 @@ import { fetchSetoranSummary } from '../../../services/API/sktApi';
 import { SetoranSummary, MejaSummary, PekerjaPair } from '../../../services/skt';
 import { saveToCache, loadFromCache, setoranSummaryCacheKey } from '../../../services/Offline/persistence';
 import { useOffline } from '../../../context/OfflineContext';
+import { useAuthStore } from '../../../store/authStore';
+import { getVisibleMejaNumbers } from '../../../utils/accessControl';
 
 type SummaryRouteProp = RouteProp<RootStackParamList, 'SetoranSummary'>;
 type NavProp = NativeStackNavigationProp<RootStackParamList, 'SetoranSummary'>;
@@ -117,7 +119,11 @@ export default function SetoranSummaryScreen() {
   const { id } = route.params;
   const { isOffline } = useOffline();
 
-  const [summary, setSummary] = useState<SetoranSummary | null>(null);
+  const user = useAuthStore((state) => state.user);
+  // The header's full, unfiltered summary — what gets cached, so a cache
+  // shared by several logins on one device is never pre-filtered for
+  // whoever happened to load it first. `summary` below is the filtered view.
+  const [fullSummary, setSummary] = useState<SetoranSummary | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
@@ -130,17 +136,10 @@ export default function SetoranSummaryScreen() {
       const data = await fetchSetoranSummary(id);
       setSummary(data);
       await saveToCache(setoranSummaryCacheKey(id), data);
-      // Expand the first meja by default, like the mockup.
-      if (data.mejaSummaries.length > 0) {
-        setExpandedMeja(new Set([data.mejaSummaries[0].nomorMeja]));
-      }
     } catch {
       const cached = await loadFromCache<SetoranSummary>(setoranSummaryCacheKey(id));
       if (cached) {
         setSummary(cached);
-        if (cached.mejaSummaries.length > 0) {
-          setExpandedMeja(new Set([cached.mejaSummaries[0].nomorMeja]));
-        }
       } else {
         setError('Unable to load setoran summary.');
       }
@@ -152,6 +151,37 @@ export default function SetoranSummaryScreen() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Same per-meja MK scoping as SKTHeaderDetailScreen (see
+  // getVisibleMejaNumbers in utils/accessControl.ts) — an MK login only
+  // sees its own meja here too, with the totals recomputed from just those.
+  const summary = useMemo((): SetoranSummary | null => {
+    if (!fullSummary) return null;
+    const visible = getVisibleMejaNumbers(
+      user,
+      fullSummary.mejaSummaries.flatMap((m) =>
+        (m.mkIds ?? []).map((mkId) => ({ nomorMeja: m.nomorMeja, mkId }))
+      )
+    );
+    if (!visible) return fullSummary;
+    const mejaSummaries = fullSummary.mejaSummaries.filter((m) => visible.has(m.nomorMeja));
+    return {
+      ...fullSummary,
+      mejaSummaries,
+      totalSetoran: mejaSummaries.reduce((sum, m) => sum + m.totalGood, 0),
+      totalUpah: mejaSummaries.reduce((sum, m) => sum + (m.totalUpah ?? 0), 0),
+    };
+  }, [fullSummary, user]);
+
+  // Expand the first visible meja by default, like the mockup — once, on
+  // the first summary that has any, so a later reload doesn't override
+  // what the user has since collapsed/expanded.
+  const didInitExpand = useRef(false);
+  useEffect(() => {
+    if (didInitExpand.current || !summary || summary.mejaSummaries.length === 0) return;
+    didInitExpand.current = true;
+    setExpandedMeja(new Set([summary.mejaSummaries[0].nomorMeja]));
+  }, [summary]);
 
   const toggleMeja = (nomorMeja: number) => {
     setExpandedMeja((prev) => {

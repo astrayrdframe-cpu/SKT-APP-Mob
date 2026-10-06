@@ -17,7 +17,7 @@ import { fetchMasterPekerja } from '../../../services/API/pekerjaApi';
 import { SKTHeaderItem, SKTDetail, SetoranWorker, TestTempRow } from '../../../services/skt';
 import { MasterPekerja } from '../../../services/pekerja';
 import { dedupeById } from '../../../utils/dedupe';
-import { canAccessHeader } from '../../../utils/accessControl';
+import { canAccessHeader, getBrakScope } from '../../../utils/accessControl';
 import {
   saveToCache,
   loadFromCache,
@@ -53,19 +53,6 @@ function greetingForHour(hour: number): string {
 // enough to tell "actually changed" from "same data came back again".
 function isSameCachedValue(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
-}
-
-// jumlahMeja is read off skt_view, not skt_header itself (see
-// SKTHeaderItem.jumlahMeja's comment in skt.ts) — a header with none means
-// no skt_view rows exist for it at all: no meja, no pekerja, no setoran was
-// ever attached to it server-side. That's not a real, usable SKT record
-// from this app's point of view, so it's dropped everywhere a fetched list
-// gets shown or written to cache (loadData/syncAllFromOrds below) — nothing
-// deletes the underlying skt_header row on the backend (this app has no
-// endpoint for that), it just never surfaces here, in-app or in the local
-// cache, on either an online fetch or an offline cache fallback.
-function isUsableHeader(item: SKTHeaderItem): boolean {
-  return item.jumlahMeja > 0;
 }
 
 export default function SKTHeaderDashboardScreen() {
@@ -117,12 +104,13 @@ export default function SKTHeaderDashboardScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [minuteTick]);
 
-  // Visibility by skt_template_header_mk_id (see canAccessHeader in
+  // Visibility by the login's Brak id (see canAccessHeader in
   // utils/accessControl.ts) — applied before the date filter so a header
   // the account can't see never even reaches the date-filtered list, let
-  // alone the FlatList below.
+  // alone the FlatList below. MK scoping happens per meja, inside the
+  // header (SKTHeaderDetailScreen).
   const accessibleItems = useMemo(
-    () => items.filter((item) => canAccessHeader(user?.skt_template_header_mk_id, item)),
+    () => items.filter((item) => canAccessHeader(user, item)),
     [items, user]
   );
 
@@ -172,9 +160,7 @@ export default function SKTHeaderDashboardScreen() {
     isRefresh ? setIsRefreshing(true) : setIsLoading(true);
     setError(null);
     try {
-      const cached = (await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST))?.filter(
-        isUsableHeader
-      );
+      const cached = await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST);
       setItems(cached ?? []);
     } finally {
       isRefresh ? setIsRefreshing(false) : setIsLoading(false);
@@ -230,18 +216,14 @@ export default function SKTHeaderDashboardScreen() {
     const masterPekerjaPromise = refreshMasterPekerja();
 
     try {
-      // Deliberately NOT filtered by isUsableHeader — this needs to be the
-      // raw previously-cached list so the staleIds sweep below (which diffs
-      // against it) can tell that a meja-less header dropped out of
-      // `freshIds`, and clean up its cache entry. Filtering it here would
-      // hide it from that diff instead.
+      // The previously-cached list — the staleIds sweep below diffs against
+      // it to clean up cache entries for headers no longer on the server.
       const previousList = (await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST)) ?? [];
-      // Meja-less headers (see isUsableHeader above) are dropped right here,
-      // before anything below reads `details` — that makes `list`/freshIds
-      // exclude them automatically, which in turn makes the staleIds sweep
-      // below remove any such header's cache entry left over from before
-      // this filter existed, on top of never writing a fresh one.
-      const details = (await fetchAllSktDetails()).filter(({ detail }) => isUsableHeader(detail));
+      // Every header is kept, including ones with no skt_view rows (no meja
+      // yet) — an MK must still see a header for their Brak before any meja
+      // has been assigned to them (see canAccessHeader in
+      // utils/accessControl.ts).
+      const details = await fetchAllSktDetails(getBrakScope(user));
       // fetchAllSktDetails already dedupes skt_header/skt_view at the fetch
       // boundary (see fetchSktHeaderRows/fetchSktViewRows in sktApi.ts), but
       // this list/each detail's `workers` gets one more explicit pass right
@@ -299,15 +281,10 @@ export default function SKTHeaderDashboardScreen() {
       }
     } catch {
       // Fall back to the last cached list — likely offline, or the
-      // endpoint is temporarily unreachable. Filtered and re-saved so a
-      // stale meja-less header gets purged from local storage even on a
-      // failed/offline "Get Data".
-      const cached = (await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST))?.filter(
-        isUsableHeader
-      );
+      // endpoint is temporarily unreachable.
+      const cached = await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST);
       if (cached && cached.length > 0) {
         setItems(cached);
-        await saveToCache(CACHE_KEYS.SKT_LIST, cached);
       } else {
         setError('Unable to load SKT data. Tap refresh to try again.');
       }
@@ -315,7 +292,7 @@ export default function SKTHeaderDashboardScreen() {
       await masterPekerjaPromise;
       setIsRefreshing(false);
     }
-  }, [refreshMasterPekerja]);
+  }, [refreshMasterPekerja, user]);
 
   // "Push Data" (Sinkronisasi Data → confirmed) — POSTs every locally
   // cached header back to skt_header (see pushAllSktHeaders in sktApi.ts).
