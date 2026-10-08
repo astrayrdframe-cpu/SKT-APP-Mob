@@ -3,13 +3,13 @@ import axios from 'axios';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useAuthStore } from '../store/authStore';
 import { updateServerTimeFromHeader } from '../services/serverTime';
-import { REACT_NATIVE_API_URL } from '@env';
+import { API_BASE_URL } from './api';
 
 
 
 const axiosInstance = axios.create({
     // baseURL: BASE_URL,
-    baseURL: REACT_NATIVE_API_URL,
+    baseURL: API_BASE_URL,
     timeout: 10000,
 });
 

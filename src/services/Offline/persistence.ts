@@ -1,4 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { dedupeById } from '../../utils/dedupe';
+import { backfillSktLogPekerjaId } from '../../utils/mejaGrouping';
+import type { SetoranWorker } from '../skt';
 
 /**
  * Generic helpers for persisting data locally so the app has something
@@ -52,3 +55,74 @@ export const CACHE_KEYS = {
 export const sktDetailCacheKey = (id: string | number) => `skt-detail-v2-${id}`;
 
 export const setoranSummaryCacheKey = (id: string | number) => `setoran-summary-${id}`;
+
+// Normalizes the whole local cache in place — run on Dashboard load and
+// after every "Get Data". Drops:
+//   - duplicate skt_master_pekerja rows (same id, or same NIK — NIK is
+//     unique per person; nomor_absen is NOT, it repeats across Braks),
+//   - duplicate SKT header / test_temp rows (same id),
+//   - duplicate worker rows inside each cached header detail (same id),
+//   - skt-detail-v2-* entries for a header that's no longer in the cached
+//     header list (removed server-side), and every legacy
+//     setoran-summary-* entry (no longer used).
+// Same-name pekerja are left alone: they're different people with
+// different NIKs. Same-seat worker rows are left alone too: each Tambah
+// Setoran submission is its own row at the submitter's seat kode.
+export async function cleanupCache(): Promise<void> {
+  try {
+    const writeIfChanged = async <T>(key: string, rows: T[] | null, deduped: T[]) => {
+      if (rows && deduped.length !== rows.length) await saveToCache(key, deduped);
+    };
+
+    const pekerja = await loadFromCache<{ id: number; nik: string }[]>(CACHE_KEYS.MASTER_PEKERJA);
+    if (pekerja) {
+      await writeIfChanged(
+        CACHE_KEYS.MASTER_PEKERJA,
+        pekerja,
+        dedupeById(
+          dedupeById(pekerja, (p) => p.id),
+          (p) => p.nik
+        )
+      );
+    }
+
+    const testTemp = await loadFromCache<{ id: number }[]>(CACHE_KEYS.TEST_TEMP);
+    if (testTemp) await writeIfChanged(CACHE_KEYS.TEST_TEMP, testTemp, dedupeById(testTemp, (r) => r.id));
+
+    const headers = await loadFromCache<{ id: number }[]>(CACHE_KEYS.SKT_LIST);
+    if (!headers) return; // never synced — nothing to compare orphans against
+    await writeIfChanged(CACHE_KEYS.SKT_LIST, headers, dedupeById(headers, (h) => h.id));
+    const headerIds = new Set(headers.map((h) => String(h.id)));
+
+    for (const key of await AsyncStorage.getAllKeys()) {
+      const match = /^(skt-detail-v2|setoran-summary)-(.+)$/.exec(key);
+      if (!match) continue;
+      // setoran-summary-* is no longer written (Setoran Summary is built
+      // from the skt-detail-v2-* workers instead), so every one is stale.
+      if (match[1] === 'setoran-summary') {
+        await removeFromCache(key);
+        continue;
+      }
+      if (!headerIds.has(match[2])) {
+        // Never drop a header holding posted setoran — those are locked
+        // locally (see hasPostedSetoran in services/API/setoranPost.ts).
+        const orphan = await loadFromCache<{ workers?: SetoranWorker[] }>(key);
+        if (!orphan?.workers?.some((w) => !!w.postedAt)) await removeFromCache(key);
+        continue;
+      }
+      if (match[1] === 'skt-detail-v2') {
+        const cached = await loadFromCache<{ detail: unknown; workers: SetoranWorker[] }>(key);
+        if (cached?.workers) {
+          const deduped = dedupeById(cached.workers, (w) => w.id);
+          // Rows cached before sktLogPekerjaId existed get it filled in here.
+          const workers = backfillSktLogPekerjaId(deduped);
+          if (workers !== deduped || deduped.length !== cached.workers.length) {
+            await saveToCache(key, { ...cached, workers });
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.warn('Failed to clean up cache:', error);
+  }
+}

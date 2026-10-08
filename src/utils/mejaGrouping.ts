@@ -14,6 +14,56 @@ export function workerIsGiling(w: SetoranWorker): boolean {
   return w.role ? w.role === 'giling' : isGilingCode(w.kodeSetoran);
 }
 
+// Whether a row records an actual setoran rather than just a roster seat:
+// either it came from a Tambah Setoran submission (has a transactionId) or
+// it carries some Good/Bad (an older skt_view row from before transaction
+// ids existed). A bare seat — a Tambah Pekerja row, or a skt_view row with
+// zero totals — is not a setoran, so it must never be paired into a List
+// Setoran card or counted toward a pair's Setoran number; otherwise two
+// empty seats become a phantom "Setoran #1" and the first real submission
+// is numbered #2.
+// The skt_log_pekerja_id of a pekerja's roster seat at a meja — the bare
+// seat row (no transactionId) with the same meja, NIK and kode. null if no
+// such seat exists or it was created on the device (no server id yet).
+export function findSeatLogPekerjaId(
+  workers: SetoranWorker[],
+  nomorMeja: number,
+  nik: string,
+  kode: string
+): number | null {
+  const seat = workers.find(
+    (w) => !w.transactionId && w.nomorMeja === nomorMeja && w.nik === nik && w.kodeSetoran === kode
+  );
+  return seat ? seatLogPekerjaId(seat) : null;
+}
+
+// A seat row's server id: its sktLogPekerjaId, or — for skt_view rows
+// cached before that field existed — its positive `id` (which for those
+// rows IS skt_log_pekerja_id; negative ids are device temp ids).
+function seatLogPekerjaId(seat: SetoranWorker): number | null {
+  return seat.sktLogPekerjaId ?? (seat.id > 0 ? seat.id : null);
+}
+
+// Fills in sktLogPekerjaId on rows cached before the field existed: seats
+// from their own server id, setoran rows from their seat. Returns the same
+// array if nothing changed.
+export function backfillSktLogPekerjaId(workers: SetoranWorker[]): SetoranWorker[] {
+  let changed = false;
+  const result = workers.map((w) => {
+    if (w.sktLogPekerjaId !== undefined) return w;
+    const sktLogPekerjaId = w.transactionId
+      ? findSeatLogPekerjaId(workers, w.nomorMeja, w.nik, w.kodeSetoran)
+      : seatLogPekerjaId(w);
+    changed = true;
+    return { ...w, sktLogPekerjaId };
+  });
+  return changed ? result : workers;
+}
+
+export function isSetoranRow(w: SetoranWorker): boolean {
+  return !!w.transactionId || (w.totalSetoran ?? 0) > 0 || (w.totalDefect ?? 0) > 0;
+}
+
 /**
  * Groups the flat SetoranWorker[] list (already fetched for the detail
  * screen) by nomor_meja, and reshapes each row into the PekerjaRow shape
@@ -171,8 +221,9 @@ export function pairSetoranByMeja(
     // definition, so a leftover Giling (or Batil) with no counterpart left
     // to pair with isn't a transaction at all, just an ordinary unpaired
     // roster seat, and shouldn't produce a "— " card for it.
-    const giling = sortForPairing(untagged.filter((w) => workerIsGiling(w)));
-    const batil = sortForPairing(untagged.filter((w) => !workerIsGiling(w)));
+    const untaggedSetoran = untagged.filter(isSetoranRow);
+    const giling = sortForPairing(untaggedSetoran.filter((w) => workerIsGiling(w)));
+    const batil = sortForPairing(untaggedSetoran.filter((w) => !workerIsGiling(w)));
     const pairCount = Math.min(giling.length, batil.length);
     const legacyPairs = Array.from({ length: pairCount }, (_, i) => {
       const g = giling[i];
@@ -276,4 +327,34 @@ export function computePairSetoranKe(
     .reduce((max, p) => Math.max(max, p.setoranKe), 0);
 
   return maxSetoranKe + 1;
+}
+
+// List Setoran sort options: by setoran sequence, Giling name or Batil name.
+export type SetoranSortKey = 'setoran' | 'giling' | 'batil';
+
+// Sorts List Setoran cards. 'setoran' orders by Setoran # then meja; the
+// name sorts are alphabetical (a missing side goes last) with Setoran # as
+// the tie-breaker, so one pekerja's cards stay in sequence. `descending`
+// reverses the whole order.
+export function sortSetoranPairs(
+  pairs: SetoranPairRow[],
+  key: SetoranSortKey,
+  descending: boolean
+): SetoranPairRow[] {
+  const bySequence = (a: SetoranPairRow, b: SetoranPairRow) =>
+    a.setoranKe - b.setoranKe || a.nomorMeja - b.nomorMeja;
+  const byName = (side: 'giling' | 'batil') => (a: SetoranPairRow, b: SetoranPairRow) => {
+    const nameA = a[side]?.namaPekerja;
+    const nameB = b[side]?.namaPekerja;
+    if (nameA !== nameB) {
+      if (!nameA) return 1;
+      if (!nameB) return -1;
+      const cmp = nameA.localeCompare(nameB, 'id');
+      if (cmp !== 0) return cmp;
+    }
+    return bySequence(a, b);
+  };
+  const compare = key === 'setoran' ? bySequence : byName(key);
+  const sorted = [...pairs].sort(compare);
+  return descending ? sorted.reverse() : sorted;
 }

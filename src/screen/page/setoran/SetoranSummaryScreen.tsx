@@ -8,12 +8,12 @@ import {
   ActivityIndicator,
   StyleSheet,
 } from 'react-native';
-import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
+import { useNavigation, useRoute, useFocusEffect, RouteProp } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { RootStackParamList } from '../../navigation/mainNavigation';
-import { fetchSetoranSummary } from '../../../services/API/sktApi';
-import { SetoranSummary, MejaSummary, PekerjaPair } from '../../../services/skt';
-import { saveToCache, loadFromCache, setoranSummaryCacheKey } from '../../../services/Offline/persistence';
+import { buildSetoranSummary } from '../../../services/API/sktApi';
+import { SetoranSummary, MejaSummary, PekerjaPair, SKTDetail, SetoranWorker } from '../../../services/skt';
+import { loadFromCache, sktDetailCacheKey } from '../../../services/Offline/persistence';
 import { useOffline } from '../../../context/OfflineContext';
 import { useAuthStore } from '../../../store/authStore';
 import { getVisibleMejaNumbers } from '../../../utils/accessControl';
@@ -87,7 +87,8 @@ function MejaSection({
               {pair.entries.map((entry, entryIdx) => (
                 <View key={entry.id} style={styles.tableRow}>
                   <Text style={[styles.tableCellMuted, styles.colSetoran]}>
-                    #{entryIdx + 1}
+                    #{entry.setoranKe ?? entryIdx + 1}
+                    {entry.posted ? <Text style={styles.postedMark}>  ✓ Terkirim</Text> : null}
                   </Text>
                   <Text style={[styles.tableCellGood, styles.colGood]}>{entry.good}</Text>
                   <Text style={[styles.tableCellBad, styles.colBad]}>{entry.bad}</Text>
@@ -98,6 +99,18 @@ function MejaSection({
                 <Text style={[styles.pairTotalLabel, styles.colSetoran]}>Total</Text>
                 <Text style={[styles.pairTotalGood, styles.colGood]}>{pair.totalGood}</Text>
                 <Text style={[styles.pairTotalBad, styles.colBad]}>{pair.totalBad}</Text>
+              </View>
+
+              {/* Upah per pekerja: Good × the role's rate (see buildSetoranSummary). */}
+              <View style={styles.pairUpahRow}>
+                <View style={styles.pairNameCol}>
+                  <Text style={styles.pairRoleLabel}>Upah Giling</Text>
+                  <Text style={styles.pairUpahValue}>{formatRupiah(pair.gilingUpah)}</Text>
+                </View>
+                <View style={styles.pairNameCol}>
+                  <Text style={styles.pairRoleLabel}>Upah Batil</Text>
+                  <Text style={styles.pairUpahValue}>{formatRupiah(pair.batilUpah)}</Text>
+                </View>
               </View>
             </View>
           ))}
@@ -129,28 +142,35 @@ export default function SetoranSummaryScreen() {
   const [query, setQuery] = useState('');
   const [expandedMeja, setExpandedMeja] = useState<Set<number>>(new Set());
 
+  // Built entirely from this header's locally cached workers — the same
+  // `skt-detail-v2-<id>` entry SKTHeaderDetailScreen reads, filled by the
+  // Dashboard's "Get Data" and updated by every local Tambah Pekerja /
+  // Setoran write. No network call: the API is only used on command.
   const load = useCallback(async () => {
     setIsLoading(true);
     setError(null);
     try {
-      const data = await fetchSetoranSummary(id);
-      setSummary(data);
-      await saveToCache(setoranSummaryCacheKey(id), data);
-    } catch {
-      const cached = await loadFromCache<SetoranSummary>(setoranSummaryCacheKey(id));
+      const cached = await loadFromCache<{ detail: SKTDetail; workers: SetoranWorker[] }>(
+        sktDetailCacheKey(id)
+      );
       if (cached) {
-        setSummary(cached);
+        setSummary(buildSetoranSummary(id, cached.workers, cached.detail));
       } else {
-        setError('Unable to load setoran summary.');
+        setError('Data belum tersedia. Jalankan Get Data terlebih dahulu.');
       }
     } finally {
       setIsLoading(false);
     }
   }, [id]);
 
-  useEffect(() => {
-    load();
-  }, [load]);
+  // Reload from the cache every time this screen comes into focus (first
+  // open, and returning to it), so it always reflects the transactions
+  // recorded in the app — including ones added/edited/deleted since.
+  useFocusEffect(
+    useCallback(() => {
+      load();
+    }, [load])
+  );
 
   // Same per-meja MK scoping as SKTHeaderDetailScreen (see
   // getVisibleMejaNumbers in utils/accessControl.ts) — an MK login only
@@ -264,6 +284,9 @@ export default function SetoranSummaryScreen() {
 }
 
 const styles = StyleSheet.create({
+  pairUpahRow: { flexDirection: 'row', marginTop: 8 },
+  pairUpahValue: { fontSize: 13, fontWeight: '700', color: '#101828', marginTop: 2 },
+  postedMark: { fontSize: 10, fontWeight: '700', color: '#067647' },
   screen: { flex: 1, backgroundColor: '#F7F8FA' },
   topBar: {
     flexDirection: 'row',

@@ -1,9 +1,10 @@
 import { buildDetailPekerja, MasterPekerja } from '../pekerja';
 import { loadFromCache, CACHE_KEYS } from '../Offline/persistence';
 import { dedupeById } from '../../utils/dedupe';
+import { SKT_API_URL } from '../../config/api';
 
 const SKT_MASTER_PEKERJA_ENDPOINT =
-  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/skt_master_pekerja';
+  `${SKT_API_URL}/skt_master_pekerja`;
 
 interface RawOrdsResponse {
   items: Record<string, any>[];
@@ -92,6 +93,25 @@ export async function fetchMasterPekerja(
         brakId: row.skt_master_brak_id,
       })
     )
+    .sort((a, b) => a.namaPekerja.localeCompare(b.namaPekerja));
+}
+
+/**
+ * The "Pilih Pekerja" list for Tambah Pekerja — read only from the local
+ * skt_master_pekerja cache that the Dashboard's "Get Data" fills (see
+ * refreshMasterPekerja in SKTHeaderDashboardScreen); the API is only ever
+ * called on that command, never from here. Throws if the cache is empty
+ * (Get Data not run yet on this device). Scoped to `brakId` when given,
+ * so an MK only ever picks from its own Brak's pekerja.
+ */
+export async function loadMasterPekerja(brakId?: number): Promise<MasterPekerja[]> {
+  const rows = (await loadFromCache<MasterPekerja[]>(CACHE_KEYS.MASTER_PEKERJA)) ?? [];
+  if (rows.length === 0) {
+    throw new Error('Daftar pekerja belum tersedia. Jalankan Get Data terlebih dahulu.');
+  }
+  return rows
+    .filter((row) => row.active && !row.isTraining)
+    .filter((row) => brakId === undefined || row.brakId === brakId)
     .sort((a, b) => a.namaPekerja.localeCompare(b.namaPekerja));
 }
 

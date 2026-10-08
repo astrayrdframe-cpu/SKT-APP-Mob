@@ -29,11 +29,14 @@ import DetailMejaModal from '../components/DetailMejaModal';
 import TambahPekerjaModal from '../components/TambahPekerjaModal';
 import TambahSetoranModal from '../setoran/TambahSetoranModal';
 import {
+  findSeatLogPekerjaId,
   groupWorkersByMeja,
   pairSetoranByMeja,
   pekerjaHasSetoran,
+  sortSetoranPairs,
   workerIsGiling,
   SetoranPairRow,
+  SetoranSortKey,
 } from '../../../utils/mejaGrouping';
 import { MasterPekerja, buildDetailPekerja } from '../../../services/pekerja';
 
@@ -67,6 +70,12 @@ interface CachedDetail {
   workers: SetoranWorker[];
 }
 
+const SORT_OPTIONS: { key: SetoranSortKey; label: string }[] = [
+  { key: 'setoran', label: 'Setoran #' },
+  { key: 'giling', label: 'Giling' },
+  { key: 'batil', label: 'Batil' },
+];
+
 export default function SKTHeaderDetailScreen() {
   const navigation = useNavigation<NavProp>();
   const route = useRoute<DetailRouteProp>();
@@ -81,6 +90,9 @@ export default function SKTHeaderDetailScreen() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedMeja, setSelectedMeja] = useState<'Semua Meja' | number>('Semua Meja');
+  // List Setoran sort — tapping the active option again flips the direction.
+  const [sortKey, setSortKey] = useState<SetoranSortKey>('setoran');
+  const [sortDescending, setSortDescending] = useState(false);
   const [showDetailMeja, setShowDetailMeja] = useState(false);
 
   // --- Tambah Pekerja dialog, nested on top of DetailMejaModal ---
@@ -199,7 +211,29 @@ export default function SKTHeaderDetailScreen() {
   // List Setoran shows one card per Tambah Setoran submission — Giling
   // paired with its Batil counterpart, not one card per worker row (see
   // pairSetoranByMeja in utils/mejaGrouping.ts for the pairing rule).
-  const setoranPairs = useMemo(() => pairSetoranByMeja(filteredWorkers), [filteredWorkers]);
+  const setoranPairs = useMemo(
+    () => sortSetoranPairs(pairSetoranByMeja(filteredWorkers), sortKey, sortDescending),
+    [filteredWorkers, sortKey, sortDescending]
+  );
+
+  const handleSortPress = (key: SetoranSortKey) => {
+    if (key === sortKey) {
+      setSortDescending((d) => !d);
+    } else {
+      setSortKey(key);
+      setSortDescending(false);
+    }
+  };
+
+  // Total Setoran pill — live from the transactions in `workers` (every
+  // meja this user can see, not just the selected tab), each setoran's
+  // Good counted once, same as List Setoran and the Summary screen. Updates
+  // the moment a setoran is added, edited or deleted, instead of the
+  // header's totalSetoran snapshot taken at the last "Get Data".
+  const liveTotalSetoran = useMemo(
+    () => pairSetoranByMeja(visibleWorkers).reduce((sum, p) => sum + p.good, 0),
+    [visibleWorkers]
+  );
 
   // Real MejaGroup[] derived from `workers` — this is what DetailMejaModal
   // actually needs (it was previously being passed brakId/jumlahMeja/workers,
@@ -231,6 +265,11 @@ export default function SKTHeaderDetailScreen() {
   // isn't a complete submission and has nothing sensible to edit/delete).
   const handleEditSetoran = (pair: SetoranPairRow) => {
     if (!pair.giling || !pair.batil) return;
+    // Posted setoran are final — already on the server, so no edit/delete.
+    if (pair.giling.postedAt || pair.batil.postedAt) {
+      Alert.alert('Setoran Sudah Terkirim', 'Setoran ini sudah dikirim ke server dan tidak dapat diubah.');
+      return;
+    }
     setEditingPair(pair);
     setScannedSetoranGiling(null);
     setScannedSetoranBatil(null);
@@ -272,10 +311,26 @@ export default function SKTHeaderDetailScreen() {
     });
   };
 
+  // Stamps each side of a setoran with the skt_log_pekerja_id of the
+  // roster seat it was scanned from (see findSeatLogPekerjaId), so the
+  // stored rows — and the POST body once setoran goes live — reference the
+  // real server seat row.
+  const withSeatLogPekerjaIds = (payload: SubmitSetoranPayload): SubmitSetoranPayload => ({
+    ...payload,
+    giling: {
+      ...payload.giling,
+      sktLogPekerjaId: findSeatLogPekerjaId(workers, payload.nomorMeja, payload.giling.nik, payload.giling.kode),
+    },
+    batil: {
+      ...payload.batil,
+      sktLogPekerjaId: findSeatLogPekerjaId(workers, payload.nomorMeja, payload.batil.nik, payload.batil.kode),
+    },
+  });
+
   const handleSubmitTambahSetoran = async (payload: SubmitSetoranPayload) => {
     setIsSubmittingSetoran(true);
     try {
-      const newWorkers = await submitSetoran(payload);
+      const newWorkers = await submitSetoran(withSeatLogPekerjaIds(payload));
       const updatedWorkers = [...workers, ...newWorkers];
       setWorkers(updatedWorkers);
       await persistWorkers(updatedWorkers);
@@ -302,7 +357,7 @@ export default function SKTHeaderDetailScreen() {
       // below, since re-scanning is disabled while editing — so there's
       // nothing extra to pass through for that here.
       const updatedRows = await updateSetoran({
-        ...payload,
+        ...withSeatLogPekerjaIds(payload),
         gilingId: oldGiling.id,
         batilId: oldBatil.id,
         transactionId: oldGiling.transactionId ?? oldBatil.transactionId,
@@ -624,7 +679,7 @@ export default function SKTHeaderDetailScreen() {
                 activeOpacity={0.75}
               >
                 <Text style={styles.statPillText}>
-                  {item.totalSetoran.toLocaleString('id-ID')} {item.totalSetoranUnit}
+                  {liveTotalSetoran.toLocaleString('id-ID')} {item.totalSetoranUnit}
                 </Text>
                 <Text style={styles.statPillIcon}>👁</Text>
               </TouchableOpacity>
@@ -661,6 +716,25 @@ export default function SKTHeaderDetailScreen() {
           <Text style={styles.setoranIcon}>⇅</Text>
           <Text style={styles.setoranHeaderText}>List Setoran</Text>
         </View>
+        <View style={styles.sortRow}>
+          <Text style={styles.sortLabel}>Urutkan:</Text>
+          {SORT_OPTIONS.map(({ key, label }) => {
+            const isActive = key === sortKey;
+            return (
+              <TouchableOpacity
+                key={key}
+                onPress={() => handleSortPress(key)}
+                style={[styles.sortChip, isActive && styles.sortChipActive]}
+                accessibilityLabel={`Urutkan berdasarkan ${label}`}
+              >
+                <Text style={[styles.sortChipText, isActive && styles.sortChipTextActive]}>
+                  {label}
+                  {isActive ? (sortDescending ? ' ↓' : ' ↑') : ''}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
 
         {visibleMeja && visibleMeja.size === 0 ? (
           <Text style={styles.emptyText}>
@@ -680,8 +754,15 @@ export default function SKTHeaderDetailScreen() {
               >
                 <View style={styles.pairTopRow}>
                   <Text style={styles.pairMejaLabel}>Meja {pair.nomorMeja}</Text>
-                  <View style={styles.pairSetoranBadge}>
-                    <Text style={styles.pairSetoranBadgeText}>Setoran #{pair.setoranKe}</Text>
+                  <View style={styles.pairBadgeRow}>
+                    {(pair.giling?.postedAt || pair.batil?.postedAt) && (
+                      <View style={[styles.pairSetoranBadge, styles.pairPostedBadge]}>
+                        <Text style={[styles.pairSetoranBadgeText, styles.pairPostedBadgeText]}>Terkirim</Text>
+                      </View>
+                    )}
+                    <View style={styles.pairSetoranBadge}>
+                      <Text style={styles.pairSetoranBadgeText}>Setoran #{pair.setoranKe}</Text>
+                    </View>
                   </View>
                 </View>
 
@@ -913,6 +994,25 @@ const styles = StyleSheet.create({
     marginBottom: 10,
   },
   setoranIcon: { fontSize: 14, color: '#101828' },
+  sortRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginBottom: 10,
+  },
+  sortLabel: { fontSize: 12, color: '#667085', marginRight: 2 },
+  sortChip: {
+    borderRadius: 14,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderWidth: 1,
+    borderColor: '#D0D5DD',
+    backgroundColor: '#FFFFFF',
+  },
+  sortChipActive: { backgroundColor: '#E8EEFC', borderColor: '#2F5FD1' },
+  sortChipText: { fontSize: 12, fontWeight: '600', color: '#475467' },
+  sortChipTextActive: { color: '#2F5FD1' },
   setoranHeaderText: { fontSize: 15, fontWeight: '700', color: '#101828' },
   setoranListWrapper: { gap: 10 },
   setoranCard: {
@@ -937,6 +1037,9 @@ const styles = StyleSheet.create({
     paddingVertical: 3,
   },
   pairSetoranBadgeText: { fontSize: 10, fontWeight: '700', color: '#2F5FD1' },
+  pairBadgeRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  pairPostedBadge: { backgroundColor: '#ECFDF3' },
+  pairPostedBadgeText: { color: '#067647' },
   // Middle row: Giling (role circle + name) on the left, Batil (name +
   // role circle) on the right — one card per paired submission instead of
   // one card per worker row.

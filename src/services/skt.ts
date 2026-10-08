@@ -22,6 +22,13 @@ export interface SKTHeaderItem {
   // are scoped by brakId, and meja by skt_view's per-row mk_id (see
   // utils/accessControl.ts). Kept because the push to skt_header sends it.
   templateHeaderMkId: number | null;
+  // Wage rate per batang (Good) for this header — skt_header's
+  // upah_giling_biasa (numeric seats "1"/"2"/"3") and upah_batil_biasa
+  // (alpha seats "A"/"B"). A pekerja's upah = their Good × their role's
+  // rate (see buildSetoranSummary). Optional: headers cached before these
+  // were stored lack them until the next "Get Data".
+  upahGilingBiasa?: number | null;
+  upahBatilBiasa?: number | null;
 }
 
 // Full detail for one header, plus the aggregated total across all its
@@ -34,7 +41,28 @@ export interface SKTDetail extends SKTHeaderItem {
 // One row from skt_view = one worker's setoran entry at a specific meja.
 // kode_setoran is "1" | "2" | "3" | "A" | "B" per meja (5 positions).
 export interface SetoranWorker {
-  id: number; // skt_log_pekerja_id
+  id: number; // skt_log_pekerja_id for skt_view rows; a negative temp id for rows created on the device
+  // The real skt_log_pekerja_id this row belongs to, kept separate from
+  // `id` so it's never confused with a device-generated temp id:
+  //  - skt_view rows (from "Get Data"): that row's own skt_log_pekerja_id.
+  //  - Tambah Setoran rows: the skt_log_pekerja_id of the roster seat the
+  //    pekerja was scanned from (same meja + NIK + kode), so a setoran POST
+  //    can reference the seat it belongs to.
+  //  - Tambah Pekerja rows (seat created on the device): null until the
+  //    server assigns one.
+  sktLogPekerjaId?: number | null;
+  // skt_master_pekerja.id of a seat created on the device by Tambah
+  // Pekerja — what Post sends to skt/skt_log_pekerja to add the seat on
+  // the server (see ensureServerSeats in services/API/setoranPost.ts).
+  // Undefined on skt_view rows and on seats cached before this field
+  // existed; Post falls back to a MASTER_PEKERJA lookup by NIK for those.
+  masterPekerjaId?: number;
+  // ISO time this setoran row was successfully POSTed to the server (see
+  // postPendingSetoran in services/API/setoranPost.ts) — set on both rows
+  // of the pair only after the server confirms. Undefined = not posted yet.
+  // A posted row can't be edited or deleted, and a header holding any
+  // posted row is left untouched by "Get Data".
+  postedAt?: string;
   // The exact seat kode ("1"/"2"/"3"/"A"/"B") the scanned pekerja actually
   // holds at this meja — read off their roster seat at scan time (see
   // TambahSetoranModal's scannedGiling/scannedBatil effects and
@@ -53,6 +81,14 @@ export interface SetoranWorker {
   totalDefect: number; // "Bad"
   jamMasuk: string;
   jamKeluar: string;
+  // skt_view's `total` (wage for this entry) and `created_date` — carried
+  // through so SetoranSummaryScreen can build Total Upah and each entry's
+  // submission order from the cached rows alone (see buildSetoranSummary
+  // in sktApi.ts). Undefined for rows created locally / cached before
+  // these fields existed: upah counts as 0, createdDate falls back to
+  // jamMasuk.
+  upah?: number;
+  createdDate?: string;
   // skt_view's mk_id — the MK assigned to this row's meja. Drives the
   // per-meja visibility filter for MK logins (see getVisibleMejaNumbers in
   // utils/accessControl.ts). Null/undefined for rows the backend hasn't
@@ -128,10 +164,12 @@ export interface SetoranWorker {
 // alone. Confirm this pairing assumption once more data is available.
 
 export interface SetoranEntry {
-  id: number; // skt_log_pekerja_id
+  id: number; // the setoran's Giling row id
+  setoranKe?: number; // the setoran's own number for its Giling+Batil pair
   good: number; // total_setoran
   bad: number; // total_defect
   createdDate: string;
+  posted?: boolean; // already sent to the server (see SetoranWorker.postedAt)
 }
 
 export interface PekerjaSlot {
@@ -146,6 +184,8 @@ export interface PekerjaPair {
   entries: SetoranEntry[]; // giling + batil entries combined, in submission order
   totalGood: number;
   totalBad: number;
+  gilingUpah: number; // totalGood × the header's upah_giling_biasa
+  batilUpah: number; // totalGood × the header's upah_batil_biasa
 }
 
 export interface MejaSummary {

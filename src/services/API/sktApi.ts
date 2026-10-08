@@ -1,15 +1,17 @@
 import { SKTHeaderItem, SKTDetail, SetoranWorker, SetoranSummary, MejaSummary, PekerjaPair, PekerjaSlot, SetoranEntry, BarcodeTrayRow, TestTempRow } from '../skt';
 import { loadFromCache, CACHE_KEYS } from '../Offline/persistence';
 import { dedupeById } from '../../utils/dedupe';
+import { pairSetoranByMeja, SetoranPairRow } from '../../utils/mejaGrouping';
+import { SKT_API_URL } from '../../config/api';
 
 const SKT_HEADER_ENDPOINT =
-  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/skt_header';
+  `${SKT_API_URL}/skt_header`;
 
 const SKT_VIEW_ENDPOINT =
-  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/skt_view';
+  `${SKT_API_URL}/skt_view`;
 
 const SKT_TEST_TEMP_ENDPOINT =
-  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/test_temp';
+  `${SKT_API_URL}/test_temp`;
 
 interface RawOrdsResponse {
   items: Record<string, any>[];
@@ -63,6 +65,8 @@ interface RawHeaderRow {
   // on hand once login (authService.ts) starts returning the current
   // user's own MK id and a visibility filter can compare the two.
   skt_template_header_mk_id: number | null;
+  upah_giling_biasa: number | null; // wage per batang, numeric (Giling) seats
+  upah_batil_biasa: number | null; // wage per batang, alpha (Batil) seats
 }
 
 interface RawViewRow {
@@ -113,6 +117,25 @@ async function fetchSktViewRows(brakIds: number[]): Promise<RawViewRow[]> {
   return dedupeById(perBrak.flat(), (r) => r.skt_log_pekerja_id);
 }
 
+// The seats one header has on the server right now (live skt_view, not the
+// cache) — Post checks these before adding a device-created seat via
+// skt/skt_log_pekerja, so a seat that's already there is never added twice
+// (see ensureServerSeats in setoranPost.ts).
+export async function fetchServerSeats(
+  brakId: number,
+  headerId: number
+): Promise<{ sktLogPekerjaId: number; nomorMeja: number; kodeSetoran: string; nik: string }[]> {
+  const rows = await fetchSktViewRows([brakId]);
+  return rows
+    .filter((r) => r.skt_header_id === headerId)
+    .map((r) => ({
+      sktLogPekerjaId: r.skt_log_pekerja_id,
+      nomorMeja: r.nomor_meja,
+      kodeSetoran: r.kode_setoran,
+      nik: r.nik,
+    }));
+}
+
 // Which Braks' skt_view rows to pull: `brakIds` when given (an MK login's
 // own Brak), otherwise every Brak that appears on a fetched header (a
 // super user, who sees them all).
@@ -160,6 +183,7 @@ function injectDualRoleTestRow(workers: SetoranWorker[]): SetoranWorker[] {
   const testRow: SetoranWorker = {
     ...gilingSample,
     id: -1, // negative id — never collides with a real skt_log_pekerja_id
+    sktLogPekerjaId: null, // fake row — must never point at a real server row
     kodeSetoran: freeBatilCode,
     namaPekerja: `${gilingSample.namaPekerja} (TEST DUAL-ROLE)`,
   };
@@ -194,64 +218,10 @@ export async function fetchSktHeaderList(brakIds?: number[] | null): Promise<SKT
       tanggal: header.header_date,
       jumlahMeja,
       templateHeaderMkId: header.skt_template_header_mk_id,
+      upahGilingBiasa: header.upah_giling_biasa,
+      upahBatilBiasa: header.upah_batil_biasa,
     };
   });
-}
-
-// ---------------------------------------------------------------------------
-// Push Data — POST the locally cached SKT headers back to skt_header
-// ---------------------------------------------------------------------------
-//
-// Dashboard's "Push Data" (Sinkronisasi Data → confirmed) sends every
-// currently-cached header up to ORDS via POST, one row per call — the same
-// SKT_HEADER_ENDPOINT this file already GETs from, just the other verb.
-//
-// ASSUMPTION: there's no local write-queue / dirty-tracking yet (nothing in
-// this app currently marks a header as "changed since last sync"), so this
-// pushes EVERY cached header indiscriminately, not just ones with real
-// local edits — confirm with the backend whether re-POSTing an unchanged
-// `id` is a safe no-op/upsert there, or whether this needs to be scoped
-// down to an actual changed-rows queue later. ALSO ASSUMPTION: the body
-// mirrors RawHeaderRow's columns (see fetchSktHeaderRows above) since
-// that's the only shape confirmed from the GET side; `jumlah_garapan_lembur`
-// has no equivalent on the cached SKTHeaderItem (only the already-derived
-// jenisLabel survives locally), so it's sent as 0 — adjust once the real
-// create/update contract is confirmed.
-async function pushSktHeaderRow(item: SKTHeaderItem): Promise<void> {
-  const response = await fetch(SKT_HEADER_ENDPOINT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      id: item.id,
-      skt_brand_id: item.brandId,
-      skt_master_brak_id: item.brakId,
-      skt_jenis_garapan_id: item.jenisGarapanId,
-      header_date: item.tanggal,
-      jumlah_garapan_lembur: 0,
-      skt_template_header_mk_id: item.templateHeaderMkId,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Gagal push skt_header id=${item.id} (status ${response.status})`);
-  }
-}
-
-/**
- * Entry point Dashboard's "Push Data" confirmation should call. Pushes
- * every item in parallel and never throws for an individual failure — it
- * reports back how many of each so the caller can tell the admin "3 of 5
- * failed" rather than losing that detail to a single thrown error.
- */
-export async function pushAllSktHeaders(
-  items: SKTHeaderItem[]
-): Promise<{ succeeded: number; failed: number }> {
-  const results = await Promise.allSettled(items.map((item) => pushSktHeaderRow(item)));
-  const failed = results.filter((r) => r.status === 'rejected');
-  failed.forEach((r) => {
-    if (r.status === 'rejected') console.warn('Push Data: one skt_header row failed:', r.reason);
-  });
-  return { succeeded: results.length - failed.length, failed: failed.length };
 }
 
 /**
@@ -285,12 +255,15 @@ function buildDetailAndWorkers(
     totalSetoran,
     totalSetoranUnit: 'btg', // ASSUMPTION — no unit field in the schema
     templateHeaderMkId: header.skt_template_header_mk_id,
+    upahGilingBiasa: header.upah_giling_biasa,
+    upahBatilBiasa: header.upah_batil_biasa,
   };
 
   const workers: SetoranWorker[] = injectDualRoleTestRow(
     relatedRows
       .map((row): SetoranWorker => ({
         id: row.skt_log_pekerja_id,
+        sktLogPekerjaId: row.skt_log_pekerja_id,
         kodeSetoran: row.kode_setoran,
         namaPekerja: row.nama_pekerja,
         nomorAbsen: row.nomor_absen,
@@ -301,6 +274,8 @@ function buildDetailAndWorkers(
         jamMasuk: row.jam_masuk,
         jamKeluar: row.jam_keluar,
         mkId: row.mk_id ?? null,
+        upah: row.total ?? 0,
+        createdDate: row.created_date,
       }))
       // Group by meja first, then by kode_setoran ("1","2","3","A","B") within it
       .sort((a, b) => a.nomorMeja - b.nomorMeja || a.kodeSetoran.localeCompare(b.kodeSetoran))
@@ -413,111 +388,93 @@ function isGilingCode(code: string): boolean {
   return GILING_CODES.has(code);
 }
 
-function toEntry(row: RawViewRow): SetoranEntry {
-  return {
-    id: row.skt_log_pekerja_id,
-    good: row.total_setoran ?? 0,
-    bad: row.total_defect ?? 0,
-    createdDate: row.created_date,
-  };
-}
-
-function toSlot(rows: RawViewRow[]): PekerjaSlot {
-  const sorted = [...rows].sort(
-    (a, b) => new Date(a.created_date).getTime() - new Date(b.created_date).getTime()
-  );
-  return {
-    namaPekerja: sorted[0].nama_pekerja,
-    nomorAbsen: sorted[0].nomor_absen,
-    entries: sorted.map(toEntry),
-  };
-}
-
 /**
- * Builds the Setoran Summary screen's data: skt_view rows for this
- * header, grouped by nomor_meja, then paired giling (numeric kode_setoran)
- * with batil (alpha kode_setoran) positionally. Workers are grouped by
- * nomor_absen first, since the same worker can have multiple entries
- * (multiple "Tambah Setoran" submissions) once that feature is wired up
- * — right now the sample data only has one entry per worker, so each
- * pair will show 1-2 rows rather than the 4-row example in the mockup.
+ * Builds the Setoran Summary screen's data from one header's cached
+ * workers — exactly the transactions recorded in the app (List Setoran's
+ * own pairing, see pairSetoranByMeja), so it's always in step with the
+ * detail screen: Tambah/edit/delete setoran show up as soon as the screen
+ * is reopened. Each setoran is one Giling+Batil pair counted ONCE (its
+ * Good/Bad come from the pair, not summed across both rows), grouped per
+ * meja by the actual Giling+Batil partners, and numbered by its real
+ * setoranKe. Bare roster seats and deleted setoran aren't setoran, so
+ * they're left out.
+ *
+ * Upah, per pekerja: their Good (batang) × their role's rate for this
+ * header — upah_giling_biasa for the Giling (numeric seat), upah_batil_biasa
+ * for the Batil (alpha seat). Same rule the server applies to skt_view's
+ * `upah` (e.g. 150 batang × 30.15 = 4522.5). Total Upah = all Giling upah
+ * + all Batil upah. A missing rate counts as 0.
  */
-export async function fetchSetoranSummary(id: number): Promise<SetoranSummary> {
-  // skt_view is fetched per Brak (see fetchSktViewRows), so look up this
-  // header's own Brak first.
-  const header = (await fetchSktHeaderRows()).find((h) => h.id === id);
-  if (!header) {
-    throw new Error(`No skt_header record found for id=${id}`);
-  }
-  const viewRows = await fetchSktViewRows([header.skt_master_brak_id]);
-  const relatedRows = viewRows.filter((v) => v.skt_header_id === id);
-
-  const mejaNumbers = Array.from(new Set(relatedRows.map((r) => r.nomor_meja))).sort(
-    (a, b) => a - b
-  );
+export function buildSetoranSummary(
+  id: number,
+  workers: SetoranWorker[],
+  rates: { upahGilingBiasa?: number | null; upahBatilBiasa?: number | null } = {}
+): SetoranSummary {
+  const gilingRate = rates.upahGilingBiasa ?? 0;
+  const batilRate = rates.upahBatilBiasa ?? 0;
+  const setoran = pairSetoranByMeja(workers);
+  const mejaNumbers = Array.from(new Set(setoran.map((p) => p.nomorMeja))).sort((a, b) => a - b);
 
   const mejaSummaries: MejaSummary[] = mejaNumbers.map((nomorMeja): MejaSummary => {
-    const mejaRows = relatedRows.filter((r) => r.nomor_meja === nomorMeja);
+    // One PekerjaPair per distinct Giling+Batil partnership at this meja.
+    const byPartners = new Map<string, SetoranPairRow[]>();
+    for (const row of setoran.filter((p) => p.nomorMeja === nomorMeja)) {
+      const key = `${row.giling?.nik}|${row.giling?.kodeSetoran}|${row.batil?.nik}|${row.batil?.kodeSetoran}`;
+      byPartners.set(key, [...(byPartners.get(key) ?? []), row]);
+    }
 
-    // Group each worker's rows together (by nomor_absen), in case they
-    // have multiple setoran entries.
-    const byWorker = new Map<string, RawViewRow[]>();
-    mejaRows.forEach((row) => {
-      const existing = byWorker.get(row.nomor_absen) ?? [];
-      byWorker.set(row.nomor_absen, [...existing, row]);
-    });
-
-    const gilingSlots: PekerjaSlot[] = [];
-    const batilSlots: PekerjaSlot[] = [];
-
-    byWorker.forEach((rows) => {
-      const slot = toSlot(rows);
-      if (isGilingCode(rows[0].kode_setoran)) {
-        gilingSlots.push(slot);
-      } else {
-        batilSlots.push(slot);
-      }
-    });
-
-    gilingSlots.sort((a, b) => a.nomorAbsen.localeCompare(b.nomorAbsen));
-    batilSlots.sort((a, b) => a.nomorAbsen.localeCompare(b.nomorAbsen));
-
-    const pairCount = Math.max(gilingSlots.length, batilSlots.length);
-    const pairs: PekerjaPair[] = Array.from({ length: pairCount }, (_, i) => {
-      const giling = gilingSlots[i] ?? null;
-      const batil = batilSlots[i] ?? null;
-      const entries = [...(giling?.entries ?? []), ...(batil?.entries ?? [])].sort(
-        (a, b) => new Date(a.createdDate).getTime() - new Date(b.createdDate).getTime()
-      );
+    const pairs: PekerjaPair[] = Array.from(byPartners.values()).map((rows) => {
+      const entries: SetoranEntry[] = rows
+        .map((row) => ({
+          id: row.giling?.id ?? row.batil!.id,
+          setoranKe: row.setoranKe,
+          good: row.good,
+          bad: row.bad,
+          createdDate: row.giling?.createdDate ?? row.giling?.jamMasuk ?? '',
+          posted: !!(row.giling?.postedAt || row.batil?.postedAt),
+        }))
+        .sort((a, b) => (a.setoranKe ?? 0) - (b.setoranKe ?? 0));
+      const slot = (w: SetoranWorker | null): PekerjaSlot | null =>
+        w ? { namaPekerja: w.namaPekerja, nomorAbsen: w.nomorAbsen, entries } : null;
       const totalGood = entries.reduce((sum, e) => sum + e.good, 0);
-      const totalBad = entries.reduce((sum, e) => sum + e.bad, 0);
-      return { giling, batil, entries, totalGood, totalBad };
+      return {
+        giling: slot(rows[0].giling),
+        batil: slot(rows[0].batil),
+        entries,
+        totalGood,
+        totalBad: entries.reduce((sum, e) => sum + e.bad, 0),
+        gilingUpah: totalGood * gilingRate,
+        batilUpah: totalGood * batilRate,
+      };
     });
-
-    const totalGood = pairs.reduce((sum, p) => sum + p.totalGood, 0);
-    const totalBad = pairs.reduce((sum, p) => sum + p.totalBad, 0);
-    const setoranCount = pairs.reduce((sum, p) => sum + p.entries.length, 0);
 
     const mkIds = Array.from(
-      new Set(mejaRows.map((r) => r.mk_id).filter((v): v is number => v != null))
+      new Set(
+        workers
+          .filter((w) => w.nomorMeja === nomorMeja)
+          .map((w) => w.mkId)
+          .filter((v): v is number => v != null)
+      )
     );
 
     return {
       nomorMeja,
       pairs,
       pasanganCount: pairs.length,
-      setoranCount,
-      totalGood,
-      totalBad,
-      totalUpah: mejaRows.reduce((sum, row) => sum + (row.total ?? 0), 0),
+      setoranCount: pairs.reduce((sum, p) => sum + p.entries.length, 0),
+      totalGood: pairs.reduce((sum, p) => sum + p.totalGood, 0),
+      totalBad: pairs.reduce((sum, p) => sum + p.totalBad, 0),
+      totalUpah: pairs.reduce((sum, p) => sum + p.gilingUpah + p.batilUpah, 0),
       mkIds,
     };
   });
 
-  const totalSetoran = mejaSummaries.reduce((sum, m) => sum + m.totalGood, 0);
-  const totalUpah = mejaSummaries.reduce((sum, m) => sum + m.totalUpah, 0);
-
-  return { headerId: id, totalSetoran, totalUpah, mejaSummaries };
+  return {
+    headerId: id,
+    totalSetoran: mejaSummaries.reduce((sum, m) => sum + m.totalGood, 0),
+    totalUpah: mejaSummaries.reduce((sum, m) => sum + m.totalUpah, 0),
+    mejaSummaries,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -532,11 +489,11 @@ export const USE_LOCAL_PEKERJA_CACHE = true;
 
 // TODO: replace with the real POST endpoint once confirmed with the backend team.
 const SKT_LOG_PEKERJA_DELETE_ENDPOINT =
-  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/TODO_REPLACE_ME_DELETE';
+  `${SKT_API_URL}/TODO_REPLACE_ME_DELETE`;
 
 // TODO: replace with the real POST endpoint once confirmed with the backend team.
 const SKT_LOG_PEKERJA_ADD_ENDPOINT =
-  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/TODO_REPLACE_ME_ADD';
+  `${SKT_API_URL}/TODO_REPLACE_ME_ADD`;
 
 export interface DeletePekerjaPayload {
   sktHeaderId: number;
@@ -628,6 +585,7 @@ async function submitAddPekerja(payload: AddPekerjaPayload): Promise<SetoranWork
   // this mapping once the actual response shape is known.
   return {
     id: data.id ?? data.skt_log_pekerja_id,
+    masterPekerjaId: payload.masterPekerjaId,
     kodeSetoran: payload.kode,
     namaPekerja: payload.namaPekerja,
     nomorAbsen: payload.nomorAbsen,
@@ -651,6 +609,7 @@ async function addPekerjaLocalCache(payload: AddPekerjaPayload): Promise<Setoran
 
   return {
     id: -Date.now(),
+    masterPekerjaId: payload.masterPekerjaId,
     kodeSetoran: payload.kode,
     namaPekerja: payload.namaPekerja,
     nomorAbsen: payload.nomorAbsen,
@@ -696,19 +655,19 @@ export const USE_LOCAL_SETORAN_CACHE = true;
 // step; this one just figures out the batang quantity for a code already
 // known-good.
 const SKT_BARCODE_TRAY_RESOLVE_ENDPOINT =
-  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/TODO_REPLACE_ME_BARCODE_TRAY';
+  `${SKT_API_URL}/TODO_REPLACE_ME_BARCODE_TRAY`;
 
 // TODO: replace with the real POST endpoint once confirmed with the backend team.
 const SKT_LOG_SETORAN_ADD_ENDPOINT =
-  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/TODO_REPLACE_ME_SETORAN_ADD';
+  `${SKT_API_URL}/TODO_REPLACE_ME_SETORAN_ADD`;
 
 // TODO: replace with the real POST endpoint once confirmed with the backend team.
 const SKT_LOG_SETORAN_DELETE_ENDPOINT =
-  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/TODO_REPLACE_ME_SETORAN_DELETE';
+  `${SKT_API_URL}/TODO_REPLACE_ME_SETORAN_DELETE`;
 
 // TODO: replace with the real POST/PUT endpoint once confirmed with the backend team.
 const SKT_LOG_SETORAN_UPDATE_ENDPOINT =
-  'http://apps.nti-skt.net:8080/ords/sktntidev/skt/TODO_REPLACE_ME_SETORAN_UPDATE';
+  `${SKT_API_URL}/TODO_REPLACE_ME_SETORAN_UPDATE`;
 
 /**
  * TEMPLATE — real lookup for one scanned tray barcode. Returns the batang
@@ -730,12 +689,14 @@ async function resolveBarcodeTrayRemote(code: string): Promise<BarcodeTrayRow> {
 
 /**
  * Local-only resolve — no master tray table to check against yet, so this
- * just hands back a plausible batang count (a fixed 50, matching the
- * reference mockup) after a short simulated delay.
+ * every recognized tray counts as a fixed TRAY_BATANG batang, after a
+ * short simulated delay.
  */
+const TRAY_BATANG = 250;
+
 async function resolveBarcodeTrayLocalCache(code: string): Promise<BarcodeTrayRow> {
   await new Promise<void>((resolve) => setTimeout(resolve, 300));
-  return { code, batang: 50 };
+  return { code, batang: TRAY_BATANG };
 }
 
 /** Entry point Tambah Setoran's "+ Scan to Add" should call. */
@@ -762,6 +723,10 @@ interface SetoranPekerjaInput {
   // (derivable via isGilingCode) but kept explicit so the POST body/report
   // doesn't need to re-derive it — not surfaced anywhere in the UI.
   role: 'giling' | 'batil';
+  // skt_log_pekerja_id of this pekerja's roster seat at the target meja
+  // (see findSeatLogPekerjaId in utils/mejaGrouping.ts) — null if that
+  // seat was itself created on the device and has no server id yet.
+  sktLogPekerjaId?: number | null;
 }
 
 export interface SubmitSetoranPayload {
@@ -802,6 +767,7 @@ function buildSetoranWorkers(
   return [
     {
       id: ids.giling,
+      sktLogPekerjaId: payload.giling.sktLogPekerjaId ?? null,
       kodeSetoran: payload.giling.kode,
       role: payload.giling.role,
       namaPekerja: payload.giling.namaPekerja,
@@ -824,6 +790,7 @@ function buildSetoranWorkers(
     },
     {
       id: ids.batil,
+      sktLogPekerjaId: payload.batil.sktLogPekerjaId ?? null,
       kodeSetoran: payload.batil.kode,
       role: payload.batil.role,
       namaPekerja: payload.batil.namaPekerja,

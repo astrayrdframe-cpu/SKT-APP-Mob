@@ -12,13 +12,14 @@ import {
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import Icon from 'react-native-vector-icons/FontAwesome5';
-import { fetchAllSktDetails, fetchTestTempData, pushAllSktHeaders } from '../../../services/API/sktApi';
+import { fetchAllSktDetails, fetchTestTempData } from '../../../services/API/sktApi';
+import { hasPostedSetoran, postPendingSetoran } from '../../../services/API/setoranPost';
 import { fetchMasterPekerja } from '../../../services/API/pekerjaApi';
 import { SKTHeaderItem, SKTDetail, SetoranWorker, TestTempRow } from '../../../services/skt';
-import { MasterPekerja } from '../../../services/pekerja';
 import { dedupeById } from '../../../utils/dedupe';
 import { canAccessHeader, getBrakScope } from '../../../utils/accessControl';
 import {
+  cleanupCache,
   saveToCache,
   loadFromCache,
   removeFromCache,
@@ -160,6 +161,9 @@ export default function SKTHeaderDashboardScreen() {
     isRefresh ? setIsRefreshing(true) : setIsLoading(true);
     setError(null);
     try {
+      // Clear any duplicates/orphaned entries before reading — see
+      // cleanupCache in services/Offline/persistence.ts.
+      await cleanupCache();
       const cached = await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST);
       setItems(cached ?? []);
     } finally {
@@ -187,11 +191,12 @@ export default function SKTHeaderDashboardScreen() {
   // has stray duplicate rows for them under different ids.
   const refreshMasterPekerja = useCallback(async () => {
     try {
-      const previousMasterPekerja = await loadFromCache<MasterPekerja[]>(CACHE_KEYS.MASTER_PEKERJA);
-      const masterPekerjaRows = await fetchMasterPekerja();
-      if (!isSameCachedValue(previousMasterPekerja, masterPekerjaRows)) {
-        await saveToCache(CACHE_KEYS.MASTER_PEKERJA, masterPekerjaRows);
-      }
+      // Always a full replace of the cached list with the fresh fetch —
+      // never merged into what was there — deduped by id and by NIK (one
+      // person = one NIK) on the way in. Only runs once the fetch has
+      // succeeded, so a failed GET leaves the previous list in place.
+      const masterPekerjaRows = dedupeById(await fetchMasterPekerja(), (p) => p.nik);
+      await saveToCache(CACHE_KEYS.MASTER_PEKERJA, masterPekerjaRows);
     } catch (masterPekerjaError) {
       console.warn('Failed to refresh skt_master_pekerja:', masterPekerjaError);
     }
@@ -230,11 +235,48 @@ export default function SKTHeaderDashboardScreen() {
       // here, at the point they're actually written to AsyncStorage — the
       // "Get Data" cache write is the one place this MUST hold, so it isn't
       // left implicit on an upstream fetch never regressing.
-      const list: SKTHeaderItem[] = dedupeById(
+      const freshList: SKTHeaderItem[] = dedupeById(
         details.map(({ detail }) => detail),
         (item) => item.id
       );
-      const freshIds = new Set(list.map((item) => item.id));
+
+      // Headers holding any posted setoran are locked: Get Data must not
+      // replace or delete them (see hasPostedSetoran in setoranPost.ts).
+      // They keep their cached header item and detail exactly as they are,
+      // even if the server copy changed or disappeared.
+      const lockedIds = new Set<number>();
+      for (const item of previousList) {
+        const cachedDetail = await loadFromCache<{ detail: SKTDetail; workers: SetoranWorker[] }>(
+          sktDetailCacheKey(item.id)
+        );
+        if (hasPostedSetoran(cachedDetail?.workers)) lockedIds.add(item.id);
+      }
+      const freshIds = new Set(freshList.map((item) => item.id));
+      // A locked header keeps its cached item, except for the wage rates —
+      // header master data, not transactions — which are refreshed so the
+      // Summary's Upah stays correct (see buildSetoranSummary).
+      const withFreshRates = <T extends SKTHeaderItem>(cachedItem: T, fresh: SKTHeaderItem): T => ({
+        ...cachedItem,
+        upahGilingBiasa: fresh.upahGilingBiasa,
+        upahBatilBiasa: fresh.upahBatilBiasa,
+      });
+      const list: SKTHeaderItem[] = [
+        ...freshList.map((item) => {
+          if (!lockedIds.has(item.id)) return item;
+          const cachedItem = previousList.find((p) => p.id === item.id);
+          return cachedItem ? withFreshRates(cachedItem, item) : item;
+        }),
+        ...previousList.filter((item) => lockedIds.has(item.id) && !freshIds.has(item.id)),
+      ];
+      // Same rate-only refresh for each locked header's cached detail.
+      for (const { detail } of details) {
+        if (!lockedIds.has(detail.id)) continue;
+        const key = sktDetailCacheKey(detail.id);
+        const cachedDetail = await loadFromCache<{ detail: SKTDetail; workers: SetoranWorker[] }>(key);
+        if (cachedDetail) {
+          await saveToCache(key, { ...cachedDetail, detail: withFreshRates(cachedDetail.detail, detail) });
+        }
+      }
 
       setItems(list);
 
@@ -250,20 +292,22 @@ export default function SKTHeaderDashboardScreen() {
       }
 
       await Promise.all(
-        details.map(async ({ detail, workers }) => {
-          const cacheKey = sktDetailCacheKey(detail.id);
-          const previousDetail = await loadFromCache<{ detail: SKTDetail; workers: SetoranWorker[] }>(
-            cacheKey
-          );
-          const freshDetail = { detail, workers: dedupeById(workers, (w) => w.id) };
-          if (!isSameCachedValue(previousDetail, freshDetail)) {
-            await saveToCache(cacheKey, freshDetail);
-          }
-        })
+        details
+          .filter(({ detail }) => !lockedIds.has(detail.id))
+          .map(async ({ detail, workers }) => {
+            const cacheKey = sktDetailCacheKey(detail.id);
+            const previousDetail = await loadFromCache<{ detail: SKTDetail; workers: SetoranWorker[] }>(
+              cacheKey
+            );
+            const freshDetail = { detail, workers: dedupeById(workers, (w) => w.id) };
+            if (!isSameCachedValue(previousDetail, freshDetail)) {
+              await saveToCache(cacheKey, freshDetail);
+            }
+          })
       );
 
       const staleIds = previousList
-        .filter((item) => !freshIds.has(item.id))
+        .filter((item) => !freshIds.has(item.id) && !lockedIds.has(item.id))
         .map((item) => item.id);
       await Promise.all(staleIds.map((id) => removeFromCache(sktDetailCacheKey(id))));
 
@@ -290,42 +334,62 @@ export default function SKTHeaderDashboardScreen() {
       }
     } finally {
       await masterPekerjaPromise;
+      // Sweep anything the sync itself didn't touch — e.g. old
+      // setoran-summary-* entries for headers no longer on the server.
+      await cleanupCache();
       setIsRefreshing(false);
     }
   }, [refreshMasterPekerja, user]);
 
-  // "Push Data" (Sinkronisasi Data → confirmed) — POSTs every locally
-  // cached header back to skt_header (see pushAllSktHeaders in sktApi.ts).
-  // No local write-queue exists yet (nothing here tracks which headers
-  // actually changed since the last sync), so this pushes the whole
-  // cached list indiscriminately — see pushAllSktHeaders' own comment for
-  // that caveat. Reports a partial-failure count rather than a flat
-  // success/error, since some rows succeeding and others failing is the
-  // expected shape of a multi-row push, not an edge case.
+  // "Push Data" (Sinkronisasi Data → confirmed) — posts the logged-in
+  // user's not-yet-posted setoran, from the local cache, one header per
+  // request (see postPendingSetoran in services/API/setoranPost.ts for the
+  // eligibility, validate-everything-first and flag-only-on-success rules).
   const pushAllDataToOrds = useCallback(async () => {
+    if (!user) return;
     setIsRefreshing(true);
     setError(null);
     try {
-      const cached = (await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST)) ?? [];
-      if (cached.length === 0) {
-        Alert.alert('Tidak Ada Data', 'Tidak ada data lokal untuk dikirim ke server.');
-        return;
-      }
-      const { succeeded, failed } = await pushAllSktHeaders(cached);
-      if (failed > 0) {
+      const { validationErrors, waiting, addedSeats, posted, failed } = await postPendingSetoran(user);
+      const sum = (rows: { setoranCount: number }[]) => rows.reduce((n, r) => n + r.setoranCount, 0);
+      // New Giling seats added to the server before their setoran, plus
+      // setoran held back because their new seat couldn't be added — not
+      // an error (see SetoranPostResult.addedSeats / .waiting).
+      const waitingNote =
+        (addedSeats.length > 0
+          ? `\n\n${addedSeats.length} pekerja baru ditambahkan ke server:\n${addedSeats.map((s) => `• ${s}`).join('\n')}`
+          : '') +
+        (waiting.length > 0
+          ? `\n\n${waiting.length} setoran menunggu (pekerja baru tidak bisa ditambahkan ke server):\n${waiting.map((w) => `• ${w}`).join('\n')}`
+          : '');
+
+      if (validationErrors.length > 0) {
         Alert.alert(
-          'Push Data Selesai Sebagian',
-          `${succeeded} data berhasil dikirim, ${failed} data gagal dikirim ke server.`
+          'Post Dibatalkan',
+          `Tidak ada data yang dikirim. Perbaiki transaksi berikut terlebih dahulu:\n\n${validationErrors.join('\n')}`
+        );
+      } else if (posted.length === 0 && failed.length === 0) {
+        Alert.alert('Tidak Ada Data', `Tidak ada setoran baru yang bisa dikirim.${waitingNote}`);
+      } else if (failed.length > 0) {
+        Alert.alert(
+          'Post Gagal',
+          [
+            posted.length > 0
+              ? `${sum(posted)} setoran berhasil dikirim (header ${posted.map((p) => p.headerId).join(', ')}).`
+              : 'Tidak ada setoran yang berhasil dikirim.',
+            'Gagal dikirim (tidak ditandai, akan dikirim ulang pada Post berikutnya):',
+            ...failed.map((f) => `• Header ${f.headerId} (${f.setoranCount} setoran): ${f.error}`),
+          ].join('\n') + waitingNote
         );
       } else {
-        Alert.alert('Push Data Berhasil', `${succeeded} data berhasil dikirim ke server.`);
+        Alert.alert('Post Berhasil', `${sum(posted)} setoran berhasil dikirim ke server.${waitingNote}`);
       }
-    } catch {
-      Alert.alert('Gagal Push Data', 'Terjadi kesalahan saat mengirim data ke server. Silakan coba lagi.');
+    } catch (postError: any) {
+      Alert.alert('Post Gagal', postError?.message || 'Terjadi kesalahan saat mengirim data ke server.');
     } finally {
       setIsRefreshing(false);
     }
-  }, []);
+  }, [user]);
 
   const todayLabel = new Date().toLocaleDateString('id-ID', {
     day: '2-digit',
@@ -499,7 +563,7 @@ export default function SKTHeaderDashboardScreen() {
         title="Apakah kamu yakin?"
         message={
           pendingSyncAction === 'push'
-            ? 'Data di server akan diperbarui dengan data lokal. Perubahan yang belum tersimpan di server mungkin akan tertimpan.'
+            ? 'Setoran Anda yang belum terkirim akan dikirim ke server. Setoran yang sudah terkirim tidak dapat diubah lagi.'
             : 'Data lokal akan diperbarui dengan data terbaru dari server. Perubahan yang belum tersimpan mungkin akan tertimpan.'
         }
         onCancel={() => setPendingSyncAction(null)}

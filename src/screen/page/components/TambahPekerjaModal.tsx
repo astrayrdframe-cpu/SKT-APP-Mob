@@ -10,7 +10,7 @@ import {
   StyleSheet,
 } from 'react-native';
 import { MasterPekerja, MejaGroup, PekerjaRow } from '../../../services/pekerja';
-import { fetchMasterPekerja } from '../../../services/API/pekerjaApi';
+import { loadMasterPekerja } from '../../../services/API/pekerjaApi';
 import { isNumericCode } from '../../../utils/pekerjaRole';
 
 // Every possible role code a meja slot can hold — numeric = giling,
@@ -97,7 +97,8 @@ export default function TambahPekerjaModal({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Load (or reload) the directory every time the dialog opens, scoped to
-  // the current Brak if one was passed in.
+  // the current Brak if one was passed in — from the local cache, so this
+  // works offline / while ORDS is unreachable (see loadMasterPekerja).
   useEffect(() => {
     if (!visible) return;
     let isCancelled = false;
@@ -105,12 +106,12 @@ export default function TambahPekerjaModal({
     setIsLoading(true);
     setLoadError(null);
 
-    fetchMasterPekerja({ brakId })
+    loadMasterPekerja(brakId)
       .then((list) => {
         if (!isCancelled) setPekerjaList(list);
       })
-      .catch(() => {
-        if (!isCancelled) setLoadError('Gagal memuat daftar pekerja.');
+      .catch((err) => {
+        if (!isCancelled) setLoadError(err?.message || 'Gagal memuat daftar pekerja.');
       })
       .finally(() => {
         if (!isCancelled) setIsLoading(false);
@@ -128,6 +129,14 @@ export default function TambahPekerjaModal({
   useEffect(() => {
     if (!scannedPekerja) return;
 
+    // The badge scanner matches against every Brak's pekerja (see
+    // findMasterPekerjaByNik), so hold a scan to the same Brak scope as
+    // the Pilih Pekerja list above.
+    if (brakId !== undefined && scannedPekerja.brakId !== brakId) {
+      setErrorMessage('Pekerja Bukan dari Brak Ini');
+      return;
+    }
+
     const otherMeja = findOtherMeja(scannedPekerja.detailPekerja, mejaGroups, nomorMeja);
     if (otherMeja !== null) {
       setErrorMessage(`Sudah Terdaftar di Meja ${otherMeja}`);
@@ -144,7 +153,7 @@ export default function TambahPekerjaModal({
     setIsDropdownOpen(false);
     setSelectedKode(null);
     setIsKodeDropdownOpen(false);
-  }, [scannedPekerja, existingPekerja, mejaGroups, nomorMeja]);
+  }, [scannedPekerja, existingPekerja, mejaGroups, nomorMeja, brakId]);
 
   const filteredPekerja =
     searchQuery.trim().length === 0
