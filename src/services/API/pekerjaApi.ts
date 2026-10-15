@@ -39,13 +39,18 @@ async function fetchAllOrdsRows(baseUrl: string): Promise<Record<string, any>[]>
 
 interface RawPekerjaRow {
   id: number;
-  nomor_absen: string;
-  nik: string;
-  nama_pekerja: string;
+  // Null on blank records (e.g. id 4862) — see the filter in fetchMasterPekerja.
+  nomor_absen: string | null;
+  nik: string | null;
+  nama_pekerja: string | null;
   active: number; // 0 | 1
   is_training: number; // 0 | 1
   skt_master_brak_id: number;
 }
+
+// Name order for every pekerja list; tolerates a missing name.
+const byNama = (a: MasterPekerja, b: MasterPekerja) =>
+  (a.namaPekerja ?? '').localeCompare(b.namaPekerja ?? '');
 
 export interface FetchMasterPekerjaOptions {
   brakId?: number; // scope to one Brak (skt_master_brak_id)
@@ -71,7 +76,16 @@ export async function fetchMasterPekerja(
       : `${SKT_MASTER_PEKERJA_ENDPOINT}?q=${encodeURIComponent(
           JSON.stringify({ skt_master_brak_id: options.brakId })
         )}`;
-  const rowsRaw = (await fetchAllOrdsRows(url)) as RawPekerjaRow[];
+  // A row without a name or NIK can't be picked or matched (e.g. a blank
+  // record like id 4862) — dropped first, so it can't break the list.
+  const rowsRaw = ((await fetchAllOrdsRows(url)) as RawPekerjaRow[])
+    .filter((row) => !!row.nama_pekerja?.trim() && !!row.nik?.trim())
+    .map((row) => ({
+      ...row,
+      nomor_absen: row.nomor_absen ?? '',
+      nik: row.nik!,
+      nama_pekerja: row.nama_pekerja!,
+    }));
   // Dropped here, at the fetch boundary — see dedupeById's own comment in
   // utils/dedupe.ts for why (a dirty view/join, or a pagination overlap,
   // shouldn't surface downstream as a duplicate name in the "Pilih
@@ -102,7 +116,7 @@ export async function fetchMasterPekerja(
         brakId: row.skt_master_brak_id,
       })
     )
-    .sort((a, b) => a.namaPekerja.localeCompare(b.namaPekerja));
+    .sort(byNama);
 }
 
 /**
@@ -118,7 +132,7 @@ export async function refreshMasterPekerjaForBrak(brakId: number): Promise<Maste
   const merged = dedupeById(
     [...fresh, ...cached.filter((row) => row.brakId !== brakId)],
     (row) => row.nik
-  ).sort((a, b) => a.namaPekerja.localeCompare(b.namaPekerja));
+  ).sort(byNama);
   await saveToCache(CACHE_KEYS.MASTER_PEKERJA, merged);
   return fresh;
 }
@@ -127,7 +141,7 @@ const selectablePekerja = (rows: MasterPekerja[], brakId?: number) =>
   rows
     .filter((row) => row.active && !row.isTraining)
     .filter((row) => brakId === undefined || row.brakId === brakId)
-    .sort((a, b) => a.namaPekerja.localeCompare(b.namaPekerja));
+    .sort(byNama);
 
 /**
  * The "Pilih Pekerja" list for Tambah Pekerja — read from the local
