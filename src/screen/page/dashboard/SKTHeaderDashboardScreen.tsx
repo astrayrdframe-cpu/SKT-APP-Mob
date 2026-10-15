@@ -18,7 +18,7 @@ import {
   loadPendingSeatDeletes,
   postPendingSetoran,
 } from '../../../services/API/setoranPost';
-import { fetchMasterPekerja } from '../../../services/API/pekerjaApi';
+import { fetchMasterPekerja, refreshMasterPekerjaForBrak } from '../../../services/API/pekerjaApi';
 import { SKTHeaderItem, SKTDetail, SetoranWorker, MasterBarcodeRow } from '../../../services/skt';
 import { dedupeById } from '../../../utils/dedupe';
 import { canAccessHeader, getBrakScope } from '../../../utils/accessControl';
@@ -187,24 +187,34 @@ export default function SKTHeaderDashboardScreen() {
   // inside that sync's try, a failure fetching skt header/detail (e.g.
   // offline mid-sync) used to skip this fetch entirely too, silently
   // leaving the pekerja directory stale even though it has nothing to do
-  // with SKT headers. Wholesale-replaces the cache with the fresh fetch
-  // rather than merging — fetchMasterPekerja already collapses any
-  // same-(nomor_absen, nama_pekerja, nik) rows down to one (see
-  // fetchMasterPekerja in pekerjaApi.ts), so a full replace can't
-  // reintroduce the same person twice even if skt_master_pekerja itself
-  // has stray duplicate rows for them under different ids.
-  const refreshMasterPekerja = useCallback(async () => {
+  // with SKT headers. A super user replaces the whole cache; an MK only
+  // re-downloads its own Brak and swaps those rows in (see
+  // refreshMasterPekerjaForBrak in pekerjaApi.ts), so another login's Brak
+  // on the same device is kept. fetchMasterPekerja collapses duplicate
+  // rows for the same person either way.
+  // Returns the error message if the pekerja download failed, else null —
+  // syncAllFromOrds shows it, so an empty Pilih Pekerja list is never silent.
+  const refreshMasterPekerja = useCallback(async (): Promise<string | null> => {
     try {
-      // Always a full replace of the cached list with the fresh fetch —
-      // never merged into what was there — deduped by id and by NIK (one
-      // person = one NIK) on the way in. Only runs once the fetch has
-      // succeeded, so a failed GET leaves the previous list in place.
-      const masterPekerjaRows = dedupeById(await fetchMasterPekerja(), (p) => p.nik);
-      await saveToCache(CACHE_KEYS.MASTER_PEKERJA, masterPekerjaRows);
-    } catch (masterPekerjaError) {
+      const brakScope = getBrakScope(user);
+      if (brakScope === null) {
+        // Super user: a full replace of the cached list with the fresh
+        // fetch, deduped by NIK (one person = one NIK) on the way in.
+        const masterPekerjaRows = dedupeById(await fetchMasterPekerja(), (p) => p.nik);
+        await saveToCache(CACHE_KEYS.MASTER_PEKERJA, masterPekerjaRows);
+      } else {
+        // MK: only its own Brak, swapped into the shared cache so other
+        // logins' Braks on this device stay intact.
+        for (const brakId of brakScope) await refreshMasterPekerjaForBrak(brakId);
+      }
+      // Either way only written once the fetch succeeded, so a failed GET
+      // leaves the previous list in place.
+      return null;
+    } catch (masterPekerjaError: any) {
       console.warn('Failed to refresh skt_master_pekerja:', masterPekerjaError);
+      return masterPekerjaError?.message || 'Gagal mengunduh daftar pekerja';
     }
-  }, []);
+  }, [user]);
 
   // "Get Data" (Sinkronisasi Data → confirmed) — a full resync from ORDS,
   // not just the summary list loadData() pulls for pull-to-refresh. Fetches
@@ -373,7 +383,13 @@ export default function SKTHeaderDashboardScreen() {
         setError('Unable to load SKT data. Tap refresh to try again.');
       }
     } finally {
-      await masterPekerjaPromise;
+      const masterPekerjaError = await masterPekerjaPromise;
+      if (masterPekerjaError) {
+        Alert.alert(
+          'Daftar Pekerja Gagal Diperbarui',
+          `Daftar pekerja (Pilih Pekerja) tidak berhasil diunduh: ${masterPekerjaError}\n\nCoba Get Data lagi saat terhubung ke jaringan kantor.`
+        );
+      }
       // Sweep anything the sync itself didn't touch — e.g. old
       // setoran-summary-* entries for headers no longer on the server.
       await cleanupCache();
@@ -390,8 +406,16 @@ export default function SKTHeaderDashboardScreen() {
     setIsRefreshing(true);
     setError(null);
     try {
-      const { validationErrors, waiting, addedSeats, deletedSeats, failedDeletes, posted, failed } =
-        await postPendingSetoran(user);
+      const {
+        validationErrors,
+        waiting,
+        addedSeats,
+        deletedSeats,
+        failedDeletes,
+        failedSeats,
+        posted,
+        failed,
+      } = await postPendingSetoran(user);
       const sum = (rows: { setoranCount: number }[]) => rows.reduce((n, r) => n + r.setoranCount, 0);
       // New Giling seats added to the server before their setoran, plus
       // setoran held back because their new seat couldn't be added — not
@@ -408,6 +432,9 @@ export default function SKTHeaderDashboardScreen() {
           : '') +
         (failedDeletes.length > 0
           ? `\n\n${failedDeletes.length} pekerja gagal dihapus dari server (akan dicoba lagi pada Post berikutnya):\n${failedDeletes.map((s) => `• ${s}`).join('\n')}`
+          : '') +
+        (failedSeats.length > 0
+          ? `\n\nPekerja baru gagal ditambahkan ke server (akan dicoba lagi pada Post berikutnya):\n${failedSeats.map((s) => `• ${s}`).join('\n')}`
           : '');
 
       if (validationErrors.length > 0) {
@@ -416,10 +443,11 @@ export default function SKTHeaderDashboardScreen() {
           `Tidak ada data yang dikirim. Perbaiki transaksi berikut terlebih dahulu:\n\n${validationErrors.join('\n')}`
         );
       } else if (posted.length === 0 && failed.length === 0) {
-        if (deletedSeats.length > 0 || failedDeletes.length > 0) {
+        const seatFailures = failedDeletes.length + failedSeats.length;
+        if (addedSeats.length > 0 || deletedSeats.length > 0 || seatFailures > 0) {
           Alert.alert(
-            failedDeletes.length > 0 ? 'Post Gagal' : 'Post Berhasil',
-            `Tidak ada setoran baru yang dikirim.${waitingNote}`
+            seatFailures > 0 ? 'Post Gagal' : 'Post Berhasil',
+            `Data pekerja dikirim ke server (tidak ada setoran baru).${waitingNote}`
           );
         } else {
           Alert.alert('Tidak Ada Data', `Tidak ada setoran baru yang bisa dikirim.${waitingNote}`);

@@ -1,5 +1,5 @@
 import { buildDetailPekerja, MasterPekerja, ScannedBadge } from '../pekerja';
-import { loadFromCache, CACHE_KEYS } from '../Offline/persistence';
+import { loadFromCache, saveToCache, CACHE_KEYS } from '../Offline/persistence';
 import { dedupeById } from '../../utils/dedupe';
 import { SKT_API_URL } from '../../config/api';
 
@@ -62,7 +62,16 @@ export interface FetchMasterPekerjaOptions {
 export async function fetchMasterPekerja(
   options?: FetchMasterPekerjaOptions
 ): Promise<MasterPekerja[]> {
-  const rowsRaw = (await fetchAllOrdsRows(SKT_MASTER_PEKERJA_ENDPOINT)) as RawPekerjaRow[];
+  // A Brak scope is filtered by ORDS itself (q=), so only that Brak's rows
+  // are downloaded — the endpoint also returns each pekerja's `foto` blob,
+  // which makes the full list several MB.
+  const url =
+    options?.brakId === undefined
+      ? SKT_MASTER_PEKERJA_ENDPOINT
+      : `${SKT_MASTER_PEKERJA_ENDPOINT}?q=${encodeURIComponent(
+          JSON.stringify({ skt_master_brak_id: options.brakId })
+        )}`;
+  const rowsRaw = (await fetchAllOrdsRows(url)) as RawPekerjaRow[];
   // Dropped here, at the fetch boundary — see dedupeById's own comment in
   // utils/dedupe.ts for why (a dirty view/join, or a pagination overlap,
   // shouldn't surface downstream as a duplicate name in the "Pilih
@@ -97,22 +106,57 @@ export async function fetchMasterPekerja(
 }
 
 /**
- * The "Pilih Pekerja" list for Tambah Pekerja — read only from the local
- * skt_master_pekerja cache that the Dashboard's "Get Data" fills (see
- * refreshMasterPekerja in SKTHeaderDashboardScreen); the API is only ever
- * called on that command, never from here. Throws if the cache is empty
- * (Get Data not run yet on this device). Scoped to `brakId` when given,
- * so an MK only ever picks from its own Brak's pekerja.
+ * Re-downloads one Brak's pekerja and swaps them into the shared
+ * CACHE_KEYS.MASTER_PEKERJA list — that Brak's cached rows are replaced,
+ * every other Brak's are kept (the cache is shared by every login on the
+ * device). Deduped by NIK with the fresh rows winning. Returns the fresh
+ * rows. Throws if the fetch fails, leaving the cache untouched.
  */
-export async function loadMasterPekerja(brakId?: number): Promise<MasterPekerja[]> {
-  const rows = (await loadFromCache<MasterPekerja[]>(CACHE_KEYS.MASTER_PEKERJA)) ?? [];
-  if (rows.length === 0) {
-    throw new Error('Daftar pekerja belum tersedia. Jalankan Get Data terlebih dahulu.');
-  }
-  return rows
+export async function refreshMasterPekerjaForBrak(brakId: number): Promise<MasterPekerja[]> {
+  const fresh = await fetchMasterPekerja({ brakId });
+  const cached = (await loadFromCache<MasterPekerja[]>(CACHE_KEYS.MASTER_PEKERJA)) ?? [];
+  const merged = dedupeById(
+    [...fresh, ...cached.filter((row) => row.brakId !== brakId)],
+    (row) => row.nik
+  ).sort((a, b) => a.namaPekerja.localeCompare(b.namaPekerja));
+  await saveToCache(CACHE_KEYS.MASTER_PEKERJA, merged);
+  return fresh;
+}
+
+const selectablePekerja = (rows: MasterPekerja[], brakId?: number) =>
+  rows
     .filter((row) => row.active && !row.isTraining)
     .filter((row) => brakId === undefined || row.brakId === brakId)
     .sort((a, b) => a.namaPekerja.localeCompare(b.namaPekerja));
+
+/**
+ * The "Pilih Pekerja" list for Tambah Pekerja — read from the local
+ * skt_master_pekerja cache that the Dashboard's "Get Data" fills (see
+ * refreshMasterPekerja in SKTHeaderDashboardScreen), scoped to `brakId`
+ * when given so an MK only ever picks from its own Brak's pekerja. Only
+ * when the cache has none for that Brak (Get Data never run here, or its
+ * pekerja download failed — e.g. another login synced this device) is the
+ * API called, for that Brak alone, and the result cached. Throws with the
+ * reason if there's still nothing to pick from.
+ */
+export async function loadMasterPekerja(brakId?: number): Promise<MasterPekerja[]> {
+  const rows = (await loadFromCache<MasterPekerja[]>(CACHE_KEYS.MASTER_PEKERJA)) ?? [];
+  const cached = selectablePekerja(rows, brakId);
+  if (cached.length > 0 || brakId === undefined) {
+    if (rows.length === 0) {
+      throw new Error('Daftar pekerja belum tersedia. Jalankan Get Data terlebih dahulu.');
+    }
+    return cached;
+  }
+  try {
+    return selectablePekerja(await refreshMasterPekerjaForBrak(brakId), brakId);
+  } catch (error: any) {
+    throw new Error(
+      `Daftar pekerja untuk Brak ini belum tersedia dan gagal diunduh (${
+        error?.message || 'tidak ada koneksi'
+      }). Pastikan terhubung ke jaringan kantor lalu jalankan Get Data.`
+    );
+  }
 }
 
 /**

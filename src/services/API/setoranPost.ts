@@ -220,6 +220,9 @@ export interface SetoranPostResult {
   // those whose delete failed (kept queued for the next Post).
   deletedSeats: string[];
   failedDeletes: string[];
+  // New seats with no setoran yet that couldn't be added (kept on the
+  // device, retried on the next Post).
+  failedSeats: string[];
   posted: { headerId: number; setoranCount: number }[];
   failed: { headerId: number; setoranCount: number; error: string }[];
 }
@@ -386,6 +389,45 @@ function prepareHeader(
     rowIds,
     setoranCount: prepared.length,
   };
+}
+
+// Every seat created on the device (Tambah Pekerja) at a meja this user
+// can see that isn't on the server yet — with or without a setoran — so
+// Post adds the pekerja even before their first transaction. A seat whose
+// pekerja has no skt_master_pekerja_id is held back in `waiting`.
+function collectNewSeats(
+  header: SKTHeaderItem,
+  workers: SetoranWorker[],
+  visibleMeja: Set<number> | null,
+  masterByNik: Map<string, MasterPekerja>,
+  waiting: string[],
+): NewSeat[] {
+  const seats = new Map<string, NewSeat>();
+  for (const w of workers) {
+    if (w.transactionId || w.sktLogPekerjaId || w.id > 0) continue;
+    if (visibleMeja && !visibleMeja.has(w.nomorMeja)) continue;
+    if (!(w.kodeSetoran in KODE_SETORAN_ID)) continue;
+    const key = seatKey(w.nomorMeja, w.kodeSetoran, w.nik);
+    if (seats.has(key)) continue;
+    const masterPekerjaId = w.masterPekerjaId ?? masterByNik.get(w.nik)?.id;
+    if (!masterPekerjaId) {
+      waiting.push(
+        `Header ${header.id}, Meja ${w.nomorMeja}, kode ${w.kodeSetoran}: ${w.namaPekerja} (${w.nik}) tidak ada di master pekerja.`,
+      );
+      continue;
+    }
+    seats.set(key, {
+      key,
+      nomorMeja: w.nomorMeja,
+      kode: w.kodeSetoran,
+      nik: w.nik,
+      namaPekerja: w.namaPekerja,
+      masterPekerjaId,
+      jamMasuk: w.shiftJamMasuk ?? null,
+      jamKeluar: w.shiftJamKeluar ?? null,
+    });
+  }
+  return Array.from(seats.values());
 }
 
 // Builds the setoran body once every seat has its server id. `newSeatIds`
@@ -578,7 +620,7 @@ async function stampSeatId(headerId: number, key: string, id: number) {
 // second seat as long as it's in the other role group. Throws on the first
 // seat that fails.
 async function ensureServerSeats(
-  item: PreparedHeader,
+  item: Pick<PreparedHeader, 'headerId' | 'brakId' | 'newSeats'>,
   createdBy: string,
   added: string[],
 ): Promise<Map<string, number>> {
@@ -717,7 +759,9 @@ async function sendPendingSeatDeletes(
  *    Giling or Batil seat that wasn't in the previous Get Data is not an
  *    error — it's queued to be added first (step 3); only if its pekerja
  *    has no skt_master_pekerja_id is that setoran held back in `waiting`.
- * 3. Send seats deleted on the device (see sendPendingSeatDeletes).
+ * 3. Send seats deleted on the device (see sendPendingSeatDeletes), then
+ *    add every pekerja created on the device that isn't on the server yet,
+ *    even one with no setoran (see collectNewSeats).
  * 4. Per header: add its new seats via skt/skt_log_pekerja, then
  *    send one setoran POST (the server commits each header atomically).
  *    Only after a header's POST succeeds are its rows flagged `postedAt`
@@ -734,6 +778,7 @@ export async function postPendingSetoran(
     addedSeats: [],
     deletedSeats: [],
     failedDeletes: [],
+    failedSeats: [],
     posted: [],
     failed: [],
   };
@@ -748,6 +793,8 @@ export async function postPendingSetoran(
   );
 
   const prepared: PreparedHeader[] = [];
+  const seatOnly: Pick<PreparedHeader, 'headerId' | 'brakId' | 'newSeats'>[] =
+    [];
   for (const header of headers) {
     const cached = await loadFromCache<CachedDetail>(
       sktDetailCacheKey(header.id),
@@ -756,10 +803,21 @@ export async function postPendingSetoran(
     const knownMeja = await loadFromCache<number[]>(
       knownMejaCacheKey(header.id, user.username),
     );
-    const pairs = eligiblePairs(
-      cached.workers,
-      withKnownMeja(getVisibleMejaNumbers(user, cached.workers), knownMeja),
+    const visibleMeja = withKnownMeja(
+      getVisibleMejaNumbers(user, cached.workers),
+      knownMeja,
     );
+    const newSeats = collectNewSeats(
+      header,
+      cached.workers,
+      visibleMeja,
+      masterByNik,
+      result.waiting,
+    );
+    if (newSeats.length > 0) {
+      seatOnly.push({ headerId: header.id, brakId: header.brakId, newSeats });
+    }
+    const pairs = eligiblePairs(cached.workers, visibleMeja);
     if (pairs.length === 0) continue;
     const ready = prepareHeader(
       header,
@@ -779,6 +837,18 @@ export async function postPendingSetoran(
   // Seat deletes go first, so a seat deleted and then re-added on the
   // device isn't matched to the old server seat by ensureServerSeats.
   await sendPendingSeatDeletes(user, createdBy, result);
+
+  // New pekerja next, whether or not they have a setoran yet. Each gets its
+  // server id stamped in the cache, so the setoran below find it and a
+  // later Post never adds it again. A failed header is retried there (if
+  // it has setoran) and on the next Post.
+  for (const item of seatOnly) {
+    try {
+      await ensureServerSeats(item, createdBy, result.addedSeats);
+    } catch (error: any) {
+      result.failedSeats.push(error?.message || `Header ${item.headerId}: gagal`);
+    }
+  }
 
   for (const item of prepared) {
     try {
