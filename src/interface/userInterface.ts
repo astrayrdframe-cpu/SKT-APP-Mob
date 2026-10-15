@@ -60,6 +60,11 @@ export interface IUser {
 // unused backend shape). Kept separate rather than merged into IUser so
 // callers reading real login responses get accurate field names/types.
 export interface ISktUser {
+  // What the account logs in with (auth/login takes email, not username).
+  // Optional only because sessions saved before the switch don't have it.
+  email?: string;
+  // Still returned by auth/login and used as the account's identity in the
+  // app (Get Data history per login, setoran created_by fallback).
   username: string;
   // 'ADMIN' (from skt_akses_admin — no mk_id/brak_id, always super user)
   // or 'MK' (from skt_mobile_user — scoped to their own mk_id/brak_id).
@@ -82,4 +87,7 @@ export interface ISktUser {
   // otherwise. Not currently enforced anywhere in the app — captured so a
   // forced-change screen can be added later without another login change.
   must_change_password: number;
+  // 1 once the account has changed its password at least once. Optional
+  // for sessions saved before auth/login started returning it.
+  sudah_change_password?: number;
 }

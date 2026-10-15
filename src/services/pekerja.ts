@@ -21,6 +21,36 @@ export function extractNikFromScan(scannedValue: string): string {
   return lastSeparatorIndex === -1 ? trimmed : trimmed.slice(lastSeparatorIndex + 3).trim();
 }
 
+// What a scanned worker badge identifies. Current badges encode the ID
+// "<brak_id>-<nomor_absen>-<nik>" with no spaces, e.g. "0003-IT006-999999994"
+// (Brak 3, absen IT006, NIK 999999994) — all three must match the same
+// skt_master_pekerja row (see findMasterPekerjaByBadge in pekerjaApi.ts).
+// Older badges ("nomor_absen - nama_pekerja - nik", or a bare NIK) carry no
+// Brak id, so brakId is null for them and only what they do carry is checked.
+export interface ScannedBadge {
+  raw: string;
+  brakId: number | null;
+  nomorAbsen: string | null;
+  nik: string;
+}
+
+export function parseBadgeScan(scannedValue: string): ScannedBadge {
+  const raw = scannedValue.trim();
+  // NIK is everything after the second "-", so a NIK containing a hyphen
+  // would still parse (none do today).
+  const id = /^(\d+)-([^-\s]+)-(\S+)$/.exec(raw);
+  if (id) {
+    return { raw, brakId: Number(id[1]), nomorAbsen: id[2], nik: id[3] };
+  }
+  const firstSeparatorIndex = raw.indexOf(' - ');
+  return {
+    raw,
+    brakId: null,
+    nomorAbsen: firstSeparatorIndex === -1 ? null : raw.slice(0, firstSeparatorIndex).trim(),
+    nik: extractNikFromScan(raw),
+  };
+}
+
 // One row in a meja's pekerja table.
 // kode is "1" | "2" | "3" (giling seats, blue badge) or "A" | "B" (batil seats, purple badge).
 export interface PekerjaRow {

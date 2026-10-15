@@ -135,6 +135,9 @@ interface TambahSetoranModalProps {
   // primitive value, so a same-code rescan wouldn't otherwise re-trigger
   // the duplicate-check effect below) — see its usage in the tray useEffect.
   scannedTrayToken?: number;
+  // The current user's Brak — a scanned tray is only accepted if its
+  // skt_master_barcode row belongs to this Brak (see resolveBarcodeTray).
+  trayBrakId?: number | null;
 }
 
 export default function TambahSetoranModal({
@@ -165,6 +168,7 @@ export default function TambahSetoranModal({
   scannedBatil,
   scannedTrayCode,
   scannedTrayToken,
+  trayBrakId,
 }: TambahSetoranModalProps) {
   const isEditing = !!existingSetoranId;
 
@@ -189,6 +193,16 @@ export default function TambahSetoranModal({
   const [isBatilDropdownOpen, setIsBatilDropdownOpen] = useState(false);
   const [barcodeTrays, setBarcodeTrays] = useState<BarcodeTrayRow[]>(initialBarcodeTrays);
   const [badWaste, setBadWaste] = useState(initialBadWaste);
+  // Bad / Waste is typed in, digits only. The field keeps its own text so
+  // it can be empty while editing; an empty field counts as 0.
+  const [badWasteText, setBadWasteText] = useState(
+    initialBadWaste ? String(initialBadWaste) : ''
+  );
+  const handleBadWasteChange = (text: string) => {
+    const digits = text.replace(/\D/g, '').replace(/^0+(?=\d)/, '');
+    setBadWasteText(digits);
+    setBadWaste(digits === '' ? 0 : Number(digits));
+  };
   const [isResolvingTray, setIsResolvingTray] = useState(false);
   // The meja a fresh add's pick(s) resolved to — null (nothing to show yet)
   // until a Giling or Batil is actually picked (manually or via scan). Once
@@ -379,8 +393,8 @@ export default function TambahSetoranModal({
   }, [scannedBatil]);
 
   // Pick up a freshly scanned tray barcode and resolve it to a batang
-  // count (see resolveBarcodeTray in sktApi.ts — placeholder until a real
-  // master tray/batch table exists).
+  // count from skt_master_barcode (see resolveBarcodeTray in sktApi.ts —
+  // also re-checks the tray is ACTIVE and belongs to trayBrakId).
   //
   // A Nomor Tray already used earlier in THIS setoran is rejected outright
   // — one physical tray can't be counted twice toward the same submission.
@@ -409,7 +423,7 @@ export default function TambahSetoranModal({
 
     let isCancelled = false;
     setIsResolvingTray(true);
-    resolveBarcodeTray(scannedTrayCode)
+    resolveBarcodeTray(scannedTrayCode, trayBrakId)
       .then((row) => {
         if (!isCancelled) setBarcodeTrays((prev) => [...prev, row]);
       })
@@ -779,23 +793,18 @@ export default function TambahSetoranModal({
 
           <Text style={[styles.fieldLabel, styles.fieldSpacing]}>Bad / Waste</Text>
           <View style={styles.stepperRow}>
-            <TouchableOpacity
-              style={styles.stepperButton}
-              onPress={() => setBadWaste((v) => Math.max(0, v - 1))}
-              activeOpacity={0.8}
-              accessibilityLabel="Kurangi Bad / Waste"
-            >
-              <Text style={styles.stepperButtonText}>−</Text>
-            </TouchableOpacity>
-            <Text style={styles.stepperValue}>{badWaste}</Text>
-            <TouchableOpacity
-              style={styles.stepperButton}
-              onPress={() => setBadWaste((v) => v + 1)}
-              activeOpacity={0.8}
-              accessibilityLabel="Tambah Bad / Waste"
-            >
-              <Text style={styles.stepperButtonText}>+</Text>
-            </TouchableOpacity>
+            <TextInput
+              style={styles.badWasteInput}
+              value={badWasteText}
+              onChangeText={handleBadWasteChange}
+              keyboardType="number-pad"
+              inputMode="numeric"
+              maxLength={6}
+              placeholder="0"
+              placeholderTextColor="#98A2B3"
+              selectTextOnFocus
+              accessibilityLabel="Bad / Waste"
+            />
             <Text style={styles.stepperUnit}>Btg</Text>
           </View>
         </ScrollView>
@@ -1060,17 +1069,15 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     paddingHorizontal: 16,
   },
-  stepperButton: {
-    width: 30,
-    height: 30,
-    borderRadius: 15,
-    backgroundColor: '#2F5FD1',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  stepperButtonText: { color: '#FFFFFF', fontSize: 17, fontWeight: '700', lineHeight: 19 },
-  stepperValue: { fontSize: 17, fontWeight: '700', color: '#101828' },
   stepperUnit: { fontSize: 12, color: '#667085', fontWeight: '600' },
+  badWasteInput: {
+    flex: 1,
+    fontSize: 17,
+    fontWeight: '700',
+    color: '#101828',
+    paddingVertical: 4,
+    marginRight: 12,
+  },
 
   footer: {
     flexDirection: 'row',

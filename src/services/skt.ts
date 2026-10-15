@@ -22,6 +22,14 @@ export interface SKTHeaderItem {
   // are scoped by brakId, and meja by skt_view's per-row mk_id (see
   // utils/accessControl.ts). Kept because the push to skt_header sends it.
   templateHeaderMkId: number | null;
+  // The MKs this header is assigned to — skt_header's nama_mk_assigned
+  // ("MK TESTING, MKITRAIN") split into names, plus the ids those names
+  // resolve to via skt_view (see resolveAssignedMkIds in sktApi.ts). An MK
+  // login only sees a header listing its own MK (see canAccessHeader in
+  // utils/accessControl.ts). Undefined on headers cached before these were
+  // stored — those fall back to the Brak check alone until "Get Data".
+  mkAssigned?: string[];
+  mkAssignedIds?: number[];
   // Wage rate per batang (Good) for this header — skt_header's
   // upah_giling_biasa (numeric seats "1"/"2"/"3") and upah_batil_biasa
   // (alpha seats "A"/"B"). A pekerja's upah = their Good × their role's
@@ -57,11 +65,20 @@ export interface SetoranWorker {
   // Undefined on skt_view rows and on seats cached before this field
   // existed; Post falls back to a MASTER_PEKERJA lookup by NIK for those.
   masterPekerjaId?: number;
+  // Clock-in / clock-out ("HH:mm") picked in Tambah Pekerja for a seat
+  // created on the device — sent as jam_masuk / jam_keluar when Post adds
+  // the seat via skt/skt_log_pekerja (see ensureServerSeats in
+  // services/API/setoranPost.ts). Kept apart from jamMasuk/jamKeluar, which
+  // hold an ISO timestamp used for ordering rows. Undefined on skt_view rows
+  // and seats cached before this field existed (sent as null then).
+  shiftJamMasuk?: string;
+  shiftJamKeluar?: string;
   // ISO time this setoran row was successfully POSTed to the server (see
   // postPendingSetoran in services/API/setoranPost.ts) — set on both rows
   // of the pair only after the server confirms. Undefined = not posted yet.
   // A posted row can't be edited or deleted, and a header holding any
-  // posted row is left untouched by "Get Data".
+  // posted row is locked: "Get Data" neither updates it from the API nor
+  // deletes it (see hasPostedSetoran in services/API/setoranPost.ts).
   postedAt?: string;
   // The exact seat kode ("1"/"2"/"3"/"A"/"B") the scanned pekerja actually
   // holds at this meja — read off their roster seat at scan time (see
@@ -94,6 +111,13 @@ export interface SetoranWorker {
   // utils/accessControl.ts). Null/undefined for rows the backend hasn't
   // tagged yet and for rows created locally.
   mkId?: number | null;
+  // EVERY MK assigned to this row's meja. skt_view repeats a seat once per
+  // assigned MK (same skt_log_pekerja_id, different mk_id); the fetch
+  // collapses those into one row and collects their mk_ids here (see
+  // fetchSktViewRows in sktApi.ts). The visibility filter checks this list,
+  // so a meja shared by two MKs shows for both. Undefined on rows cached
+  // before this field existed (mkId is used then) and on local rows.
+  mkIds?: number[];
   // This submission's running number for its specific Giling+Batil PAIR —
   // not a meja-wide counter. "Role 1 + Role A" and "Role 1 + Role B" are
   // different pairs (different Batil person) and each counts its own
@@ -126,9 +150,9 @@ export interface SetoranWorker {
   // for those should fall back to isGilingCode(kodeSetoran) (see
   // workerIsGiling in utils/mejaGrouping.ts).
   role?: 'giling' | 'batil';
-  // How many Barcode Tray codes were scanned for this submission — from
-  // skt/test_temp for now (see resolveBarcodeTray), not a real master
-  // tray/batch table. Same availability caveat as setoranKe: undefined
+  // How many Barcode Tray codes were scanned for this submission (each
+  // checked against skt_master_barcode, see resolveBarcodeTray). Same
+  // availability caveat as setoranKe: undefined
   // for skt_view rows, since there's no such column there either.
   trayCount?: number;
   // The actual scanned tray rows behind `trayCount`, kept around so
@@ -218,14 +242,14 @@ export interface BarcodeTrayRow {
   batang: number;
 }
 
-// One row from the skt/test_temp ORDS endpoint. A standalone test/demo
-// table — not tied to any SKT header/meja/pekerja — pulled in during the
-// Dashboard's "Get Data" resync and cached for later use.
-export interface TestTempRow {
+// One row from the skt/skt_master_barcode ORDS endpoint — the master list
+// of physical trays. Each tray belongs to exactly one Brak and carries its
+// own batang count. Pulled in during the Dashboard's "Get Data" resync and
+// cached so tray scans work offline.
+export interface MasterBarcodeRow {
   id: number;
-  nameTest: string;
-  createdDate: string;
-  createdBy: string;
-  updatedDate: string | null;
-  updatedBy: string | null;
+  code: string; // printed tray barcode, e.g. "SL-KL-0001"
+  brakId: number; // skt_master_brak_id — a tray is only valid for this Brak
+  status: string; // 'ACTIVE' | 'INACTIVE'
+  jumlahBatang: number;
 }

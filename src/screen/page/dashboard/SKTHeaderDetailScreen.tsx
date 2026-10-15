@@ -21,10 +21,19 @@ import {
   SubmitSetoranPayload,
 } from '../../../services/API/sktApi';
 import { SKTDetail, SetoranWorker } from '../../../services/skt';
-import { saveToCache, loadFromCache, sktDetailCacheKey } from '../../../services/Offline/persistence';
+import {
+  saveToCache,
+  loadFromCache,
+  sktDetailCacheKey,
+  knownMejaCacheKey,
+} from '../../../services/Offline/persistence';
 import { useOffline } from '../../../context/OfflineContext';
 import { useAuthStore } from '../../../store/authStore';
-import { canAccessHeader, getVisibleMejaNumbers } from '../../../utils/accessControl';
+import {
+  canAccessHeader,
+  getVisibleMejaNumbers,
+  withKnownMeja,
+} from '../../../utils/accessControl';
 import DetailMejaModal from '../components/DetailMejaModal';
 import TambahPekerjaModal from '../components/TambahPekerjaModal';
 import TambahSetoranModal from '../setoran/TambahSetoranModal';
@@ -38,7 +47,8 @@ import {
   SetoranPairRow,
   SetoranSortKey,
 } from '../../../utils/mejaGrouping';
-import { MasterPekerja, buildDetailPekerja } from '../../../services/pekerja';
+import { MasterPekerja, MejaGroup, buildDetailPekerja } from '../../../services/pekerja';
+import { queueSeatDelete, takePendingSeatDelete } from '../../../services/API/setoranPost';
 
 // Reshapes an existing SetoranWorker row into the MasterPekerja shape
 // TambahSetoranModal's giling/batil state expects, so tapping a List
@@ -178,7 +188,36 @@ export default function SKTHeaderDetailScreen() {
   // views below are filtered — `workers` itself stays complete, since it's
   // what persistWorkers writes back to the shared cache and what
   // TambahSetoranModal numbers new setoran against.
-  const visibleMeja = useMemo(() => getVisibleMejaNumbers(user, workers), [user, workers]);
+  const workerMeja = useMemo(() => getVisibleMejaNumbers(user, workers), [user, workers]);
+
+  // Meja this login has seen on this header before (see knownMejaCacheKey)
+  // — null until loaded. A meja whose last pekerja was deleted has no rows
+  // left to show it by, so it's kept listed (empty) from here.
+  const knownMejaKey = knownMejaCacheKey(id, user?.username ?? '');
+  const [knownMeja, setKnownMeja] = useState<number[] | null>(null);
+
+  useEffect(() => {
+    let isCancelled = false;
+    loadFromCache<number[]>(knownMejaKey).then((saved) => {
+      if (!isCancelled) setKnownMeja(saved ?? []);
+    });
+    return () => {
+      isCancelled = true;
+    };
+  }, [knownMejaKey]);
+
+  // Remember every meja that currently has visible rows.
+  useEffect(() => {
+    if (knownMeja === null) return;
+    const current = workerMeja ?? new Set(workers.map((w) => w.nomorMeja));
+    const merged = new Set([...knownMeja, ...current]);
+    if (merged.size === knownMeja.length) return;
+    const next = Array.from(merged).sort((a, b) => a - b);
+    setKnownMeja(next);
+    saveToCache(knownMejaKey, next);
+  }, [knownMeja, workerMeja, workers, knownMejaKey]);
+
+  const visibleMeja = useMemo(() => withKnownMeja(workerMeja, knownMeja), [workerMeja, knownMeja]);
 
   const visibleWorkers = useMemo(
     () => (visibleMeja ? workers.filter((w) => visibleMeja.has(w.nomorMeja)) : workers),
@@ -194,9 +233,10 @@ export default function SKTHeaderDetailScreen() {
       : new Set([
           ...Array.from({ length: detail?.jumlahMeja ?? 0 }, (_, i) => i + 1),
           ...workers.map((w) => w.nomorMeja),
+          ...(knownMeja ?? []),
         ]);
     return Array.from(numbers).sort((a, b) => a - b);
-  }, [visibleMeja, detail?.jumlahMeja, workers]);
+  }, [visibleMeja, detail?.jumlahMeja, workers, knownMeja]);
 
   const mejaTabs = useMemo(
     () => ['Semua Meja', ...mejaNumbers] as ('Semua Meja' | number)[],
@@ -238,7 +278,15 @@ export default function SKTHeaderDetailScreen() {
   // Real MejaGroup[] derived from `workers` — this is what DetailMejaModal
   // actually needs (it was previously being passed brakId/jumlahMeja/workers,
   // none of which match the component's props, hence the undefined crash).
-  const mejaGroups = useMemo(() => groupWorkersByMeja(visibleWorkers), [visibleWorkers]);
+  // Every meja in mejaNumbers gets a section — one with no pekerja (e.g.
+  // its last one was deleted) stays, empty, with "+ Add Pekerja".
+  const mejaGroups = useMemo(() => {
+    const groups = groupWorkersByMeja(visibleWorkers);
+    const empty: MejaGroup[] = mejaNumbers
+      .filter((n) => !groups.some((g) => g.nomorMeja === n))
+      .map((nomorMeja) => ({ nomorMeja, pekerja: [] }));
+    return [...groups, ...empty].sort((a, b) => a.nomorMeja - b.nomorMeja);
+  }, [visibleWorkers, mejaNumbers]);
 
   // The pekerja already sitting in the meja currently being added to —
   // TambahPekerjaModal uses this to compute which role codes are still free.
@@ -282,14 +330,20 @@ export default function SKTHeaderDetailScreen() {
   // Shared by all three scans inside TambahSetoranModal — hides the
   // dialog, navigates to the scanner for that scan's target (AbsensiScan
   // for Giling/Batil against skt_master_pekerja; the dedicated
-  // BarcodeTrayScan for Barcode Tray against skt/test_temp), then reopens
-  // the dialog once the scanner resolves or is cancelled. Same "hide →
-  // navigate → reopen" shape as handleAddPekerja below.
+  // BarcodeTrayScan for Barcode Tray against skt_master_barcode), then
+  // reopens the dialog once the scanner resolves or is cancelled. Same
+  // "hide → navigate → reopen" shape as handleAddPekerja below.
+  //
+  // Trays must belong to the logged-in user's Brak. ADMIN logins have no
+  // brak_id of their own, so they fall back to this header's Brak.
+  const trayBrakId = user?.brak_id ?? detail?.brakId ?? null;
+
   const handlePressScanSetoran = (target: 'giling' | 'batil' | 'tray') => {
     setShowTambahSetoran(false);
 
     if (target === 'tray') {
       navigation.navigate('BarcodeTrayScan', {
+        brakId: trayBrakId,
         onScannedCode: (code) => {
           setScannedTrayCode(code);
           setScannedTrayToken((t) => t + 1);
@@ -505,6 +559,26 @@ export default function SKTHeaderDetailScreen() {
                 return;
               }
             }
+            // Deleted locally right away. A seat that's on the server (from
+            // Get Data, or added by an earlier Post) is also queued, and the
+            // next Post sends it as skt_log_pekerja action "delete"; a seat
+            // only on the device has nothing to sync.
+            const serverSeatId =
+              worker?.sktLogPekerjaId ?? (worker && worker.id > 0 ? worker.id : null);
+            if (worker && serverSeatId) {
+              await queueSeatDelete({
+                headerId: item.id,
+                sktLogPekerjaId: serverSeatId,
+                nomorMeja,
+                kode: worker.kodeSetoran,
+                nik: worker.nik,
+                namaPekerja: worker.namaPekerja,
+                masterPekerjaId: worker.masterPekerjaId,
+                jamMasuk: worker.shiftJamMasuk ?? worker.jamMasuk,
+                jamKeluar: worker.shiftJamKeluar ?? worker.jamKeluar,
+                row: worker,
+              });
+            }
             await deletePekerjaFromMeja({ sktHeaderId: item.id, nomorMeja, pekerjaId });
             const updatedWorkers = workers.filter((w) => w.id !== pekerjaId);
             setWorkers(updatedWorkers);
@@ -522,13 +596,44 @@ export default function SKTHeaderDetailScreen() {
     ]);
   };
 
-  const handleSubmitTambahPekerja = async (pekerja: MasterPekerja, kode: string) => {
+  const handleSubmitTambahPekerja = async (
+    pekerja: MasterPekerja,
+    kode: string,
+    jamMasuk: string,
+    jamKeluar: string
+  ) => {
     const nomorMeja = activeAddMeja;
     if (nomorMeja === null) return;
 
     setShowTambahPekerja(false);
 
     try {
+      // Same pekerja back on the same meja/kode before Post: undo the
+      // pending delete and restore the original server seat (same
+      // skt_log_pekerja_id) instead of creating a new one — so Post neither
+      // deletes it nor adds it again.
+      const undone = await takePendingSeatDelete(item.id, nomorMeja, kode, pekerja.nik);
+      if (undone) {
+        const restored: SetoranWorker = undone.row ?? {
+          id: undone.sktLogPekerjaId,
+          sktLogPekerjaId: undone.sktLogPekerjaId,
+          masterPekerjaId: undone.masterPekerjaId ?? pekerja.id,
+          kodeSetoran: kode,
+          namaPekerja: pekerja.namaPekerja,
+          nomorAbsen: pekerja.nomorAbsen,
+          nik: pekerja.nik,
+          nomorMeja,
+          totalSetoran: 0,
+          totalDefect: 0,
+          jamMasuk: new Date().toISOString(),
+          jamKeluar: '',
+        };
+        const updatedWorkers = [...workers.filter((w) => w.id !== restored.id), restored];
+        setWorkers(updatedWorkers);
+        await persistWorkers(updatedWorkers);
+        return;
+      }
+
       const newWorker = await addPekerjaToMeja({
         sktHeaderId: item.id,
         nomorMeja,
@@ -537,6 +642,8 @@ export default function SKTHeaderDetailScreen() {
         nik: pekerja.nik,
         namaPekerja: pekerja.namaPekerja,
         nomorAbsen: pekerja.nomorAbsen,
+        jamMasuk,
+        jamKeluar,
       });
       const updatedWorkers = [...workers, newWorker];
       setWorkers(updatedWorkers);
@@ -917,6 +1024,7 @@ export default function SKTHeaderDetailScreen() {
         scannedBatil={scannedSetoranBatil}
         scannedTrayCode={scannedTrayCode}
         scannedTrayToken={scannedTrayToken}
+        trayBrakId={trayBrakId}
       />
     </View>
   );

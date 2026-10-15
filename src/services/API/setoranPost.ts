@@ -5,10 +5,12 @@ import {
   saveToCache,
   CACHE_KEYS,
   sktDetailCacheKey,
+  knownMejaCacheKey,
 } from '../Offline/persistence';
 import {
   canAccessHeader,
   getVisibleMejaNumbers,
+  withKnownMeja,
 } from '../../utils/accessControl';
 import { workerIsGiling } from '../../utils/mejaGrouping';
 import { SKT_API_URL } from '../../config/api';
@@ -22,12 +24,17 @@ import { fetchServerSeats } from './sktApi';
 // "log_pekerja wajib diisi" (400) or "SKT Header ID 0 tidak ditemukan" (404).
 const SKT_SETORAN_POST_ENDPOINT = `${SKT_API_URL}/skt_header`;
 
-// Custom ORDS handler (POST only) that adds one pekerja seat to a header.
-// Post calls it for each Giling and Batil seat of a setoran that was
-// created on the device (Tambah Pekerja) and isn't on the server, before
-// sending that header's setoran, so the setoran can reference the new
-// Giling seat's skt_log_pekerja_id and the Batil seat it names exists.
+// Custom ORDS handler (POST only) for pekerja seats on a header. With no
+// `action` it adds one seat — Post calls it for each Giling and Batil seat
+// of a setoran that was created on the device (Tambah Pekerja) and isn't
+// on the server, before sending that header's setoran, so the setoran can
+// reference the new Giling seat's skt_log_pekerja_id and the Batil seat it
+// names exists. With `action` ("update" | "replace" | "delete") it acts on
+// an existing seat named by skt_log_pekerja_id (see sendLogPekerjaAction);
+// an unknown id answers 404 "SKT Log Pekerja ID <id> tidak ditemukan".
 const SKT_LOG_PEKERJA_POST_ENDPOINT = `${SKT_API_URL}/skt_log_pekerja`;
+
+export type LogPekerjaAction = 'update' | 'replace' | 'delete';
 
 export interface LogPekerjaPostBody {
   skt_header_id: number;
@@ -36,20 +43,52 @@ export interface LogPekerjaPostBody {
   is_training: 0;
   nomor_meja: number;
   skt_kode_setoran_id: number; // see KODE_SETORAN_ID
-  jam_masuk: null;
-  jam_keluar: null;
+  jam_masuk: string | null; // "HH:mm", e.g. "06:00"
+  jam_keluar: string | null; // "HH:mm", e.g. "14:00"
 }
 
 // skt_kode_setoran_id for each seat role assigned on the device. The
 // handler only accepts the numeric id ("B" is rejected as
 // "skt_kode_setoran_id wajib diisi").
-const KODE_SETORAN_ID: Record<string, number> = {
+export const KODE_SETORAN_ID: Record<string, number> = {
   '1': 1,
   '2': 2,
   '3': 3,
   A: 4,
   B: 5,
 };
+
+// "HH:mm" or null — skt_view's jam_masuk/jam_keluar format isn't fixed, so
+// only a value that already starts with HH:mm is passed on.
+function toHHmm(value: string | null | undefined): string | null {
+  return value && /^\d{2}:\d{2}/.test(value) ? value.slice(0, 5) : null;
+}
+
+// The seat's details under its SKT header (the card opened on the
+// Dashboard) — the body every skt_log_pekerja call sends, whether adding
+// the seat or acting on it (update / replace / delete).
+export function buildSeatBody(
+  headerId: number,
+  createdBy: string,
+  seat: {
+    masterPekerjaId: number;
+    nomorMeja: number;
+    kode: string;
+    jamMasuk?: string | null;
+    jamKeluar?: string | null;
+  },
+): LogPekerjaPostBody {
+  return {
+    skt_header_id: headerId,
+    created_by: createdBy,
+    skt_master_pekerja_id: seat.masterPekerjaId,
+    is_training: 0,
+    nomor_meja: seat.nomorMeja,
+    skt_kode_setoran_id: KODE_SETORAN_ID[seat.kode],
+    jam_masuk: toHHmm(seat.jamMasuk),
+    jam_keluar: toHHmm(seat.jamKeluar),
+  };
+}
 
 // Request body — one per SKT header. Each log_pekerja entry is a GILING
 // seat (its skt_log_pekerja_id from skt_view); each setoran under it is
@@ -87,6 +126,8 @@ interface NewSeat {
   nik: string;
   namaPekerja: string;
   masterPekerjaId: number;
+  jamMasuk: string | null; // "HH:mm" from Tambah Pekerja
+  jamKeluar: string | null;
 }
 
 // One header ready to send: its validated pairs (each with its seat's
@@ -102,6 +143,67 @@ interface PreparedHeader {
   setoranCount: number;
 }
 
+// A server seat deleted on the device (Detail Meja → Delete), waiting for
+// the next Post to send it as skt_log_pekerja action "delete".
+export interface PendingSeatDelete {
+  headerId: number; // the SKT header the seat sits under
+  sktLogPekerjaId: number;
+  nomorMeja: number;
+  kode: string;
+  nik: string;
+  namaPekerja: string;
+  // Known for seats added on the device; seats from Get Data resolve it
+  // from the cached master pekerja list by NIK when the delete is sent.
+  masterPekerjaId?: number;
+  jamMasuk?: string | null;
+  jamKeluar?: string | null;
+  // The deleted row as it was, so re-adding the same pekerja before Post
+  // can put it back (see takePendingSeatDelete). Undefined on entries
+  // queued before this was stored.
+  row?: SetoranWorker;
+}
+
+export async function loadPendingSeatDeletes(): Promise<PendingSeatDelete[]> {
+  return (
+    (await loadFromCache<PendingSeatDelete[]>(
+      CACHE_KEYS.PENDING_SEAT_DELETES,
+    )) ?? []
+  );
+}
+
+export async function queueSeatDelete(entry: PendingSeatDelete): Promise<void> {
+  const pending = await loadPendingSeatDeletes();
+  if (pending.some(p => p.sktLogPekerjaId === entry.sktLogPekerjaId)) return;
+  await saveToCache(CACHE_KEYS.PENDING_SEAT_DELETES, [...pending, entry]);
+}
+
+// Re-adding a pekerja whose seat delete is still pending — same header,
+// meja, kode and NIK — undoes that delete on the device: the entry leaves
+// the queue (nothing is sent on Post) and is returned so the caller can
+// restore the original server seat. Null when there's no such pending
+// delete, i.e. this is a genuinely new seat.
+export async function takePendingSeatDelete(
+  headerId: number,
+  nomorMeja: number,
+  kode: string,
+  nik: string,
+): Promise<PendingSeatDelete | null> {
+  const pending = await loadPendingSeatDeletes();
+  const match = pending.find(
+    p =>
+      p.headerId === headerId &&
+      p.nomorMeja === nomorMeja &&
+      p.kode === kode &&
+      p.nik === nik,
+  );
+  if (!match) return null;
+  await saveToCache(
+    CACHE_KEYS.PENDING_SEAT_DELETES,
+    pending.filter(p => p !== match),
+  );
+  return match;
+}
+
 export interface SetoranPostResult {
   // Validation problems found before anything was sent. Non-empty means
   // NOTHING was posted (see postPendingSetoran).
@@ -114,6 +216,10 @@ export interface SetoranPostResult {
   // Giling/Batil seats added to the server via skt/skt_log_pekerja during this
   // Post, e.g. "Header 5982, Meja 1, kode 3: CINDY OLIVIA".
   addedSeats: string[];
+  // Seats deleted on the device and now deleted on the server too, and
+  // those whose delete failed (kept queued for the next Post).
+  deletedSeats: string[];
+  failedDeletes: string[];
   posted: { headerId: number; setoranCount: number }[];
   failed: { headerId: number; setoranCount: number; error: string }[];
 }
@@ -149,7 +255,8 @@ export function setoranCreatedBy(
 }
 
 // Whether a header's cached rows include any posted setoran — such a
-// header is locked against "Get Data" replacing or deleting it.
+// header is locked: "Get Data" neither updates it from the API nor deletes
+// it, so posted transactions are never pulled back down or posted twice.
 export function hasPostedSetoran(
   workers: SetoranWorker[] | undefined,
 ): boolean {
@@ -244,6 +351,8 @@ function prepareHeader(
         nik: side.nik,
         namaPekerja: side.namaPekerja,
         masterPekerjaId,
+        jamMasuk: seatRow?.shiftJamMasuk ?? null,
+        jamKeluar: seatRow?.shiftJamKeluar ?? null,
       });
     }
     if (invalid) continue;
@@ -364,6 +473,51 @@ async function postJson(url: string, body: unknown): Promise<any> {
   return data;
 }
 
+// Runs an update / replace / delete on an existing server seat. update and
+// replace take the same fields as an add (skt_header_id,
+// skt_master_pekerja_id, nomor_meja, skt_kode_setoran_id, is_training,
+// jam_masuk, jam_keluar, created_by); delete only needs the id.
+export async function sendLogPekerjaAction(
+  action: LogPekerjaAction,
+  sktLogPekerjaId: number,
+  fields: Partial<LogPekerjaPostBody> = {},
+): Promise<any> {
+  return postJson(SKT_LOG_PEKERJA_POST_ENDPOINT, {
+    ...fields,
+    action,
+    skt_log_pekerja_id: sktLogPekerjaId,
+  });
+}
+
+export function updateServerSeat(
+  sktLogPekerjaId: number,
+  body: LogPekerjaPostBody,
+): Promise<any> {
+  return sendLogPekerjaAction('update', sktLogPekerjaId, body);
+}
+
+export function replaceServerSeat(
+  sktLogPekerjaId: number,
+  body: LogPekerjaPostBody,
+): Promise<any> {
+  return sendLogPekerjaAction('replace', sktLogPekerjaId, body);
+}
+
+// Removes a seat from the server, sending its header + seat details along
+// with the id. A 404 means it's already gone there, which is what the
+// caller wanted, so it isn't treated as a failure.
+export async function deleteServerSeat(
+  sktLogPekerjaId: number,
+  body: Partial<LogPekerjaPostBody>,
+): Promise<void> {
+  try {
+    await sendLogPekerjaAction('delete', sktLogPekerjaId, body);
+  } catch (error) {
+    if (error instanceof PostError && error.status === 404) return;
+    throw error;
+  }
+}
+
 // Builds a traceable error for a seat that couldn't be assigned on the
 // server: which header/meja/kode/pekerja, the request body sent, and the
 // server's status and response. Also logged to the console (Metro /
@@ -419,7 +573,10 @@ async function stampSeatId(headerId: number, key: string, id: number) {
 // added since the last Get Data, e.g. by an earlier Post whose setoran
 // then failed); only seats missing there are added via skt_log_pekerja.
 // The new id is read from the response, or looked up in skt_view again if
-// the response doesn't carry it. Throws on the first seat that fails.
+// the response doesn't carry it. A pekerja may hold one Giling and one
+// Batil seat on the same header (dual role) — skt_log_pekerja accepts the
+// second seat as long as it's in the other role group. Throws on the first
+// seat that fails.
 async function ensureServerSeats(
   item: PreparedHeader,
   createdBy: string,
@@ -451,16 +608,7 @@ async function ensureServerSeats(
   for (const seat of item.newSeats) {
     let id = live.get(seat.key);
     if (!id) {
-      const body: LogPekerjaPostBody = {
-        skt_header_id: item.headerId,
-        created_by: createdBy,
-        skt_master_pekerja_id: seat.masterPekerjaId,
-        is_training: 0,
-        nomor_meja: seat.nomorMeja,
-        skt_kode_setoran_id: KODE_SETORAN_ID[seat.kode],
-        jam_masuk: null,
-        jam_keluar: null,
-      };
+      const body = buildSeatBody(item.headerId, createdBy, seat);
       let data: any;
       try {
         data = await postJson(SKT_LOG_PEKERJA_POST_ENDPOINT, body);
@@ -508,6 +656,56 @@ async function ensureServerSeats(
   return ids;
 }
 
+// Sends every queued seat delete for headers this user can access as
+// skt_log_pekerja action "delete". Each one leaves the queue only once the
+// server confirms it (or answers 404 — already gone); a failed one stays
+// queued for the next Post.
+async function sendPendingSeatDeletes(
+  user: ISktUser,
+  createdBy: string,
+  result: SetoranPostResult,
+): Promise<void> {
+  const pending = await loadPendingSeatDeletes();
+  if (pending.length === 0) return;
+  const headers =
+    (await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST)) ?? [];
+  const masterByNik = new Map(
+    (
+      (await loadFromCache<MasterPekerja[]>(CACHE_KEYS.MASTER_PEKERJA)) ?? []
+    ).map(p => [p.nik, p]),
+  );
+  const done = new Set<number>();
+  for (const seat of pending) {
+    const header = headers.find(h => h.id === seat.headerId);
+    if (header && !canAccessHeader(user, header)) continue;
+    const label = `Header ${seat.headerId}, Meja ${seat.nomorMeja}, kode ${seat.kode}: ${seat.namaPekerja}`;
+    const masterPekerjaId =
+      seat.masterPekerjaId ?? masterByNik.get(seat.nik)?.id;
+    const { skt_master_pekerja_id, ...rest } = buildSeatBody(
+      seat.headerId,
+      createdBy,
+      { ...seat, masterPekerjaId: masterPekerjaId ?? 0 },
+    );
+    try {
+      await deleteServerSeat(
+        seat.sktLogPekerjaId,
+        masterPekerjaId ? { ...rest, skt_master_pekerja_id } : rest,
+      );
+      done.add(seat.sktLogPekerjaId);
+      result.deletedSeats.push(label);
+    } catch (error: any) {
+      result.failedDeletes.push(`${label} (${error?.message || 'Gagal'})`);
+    }
+  }
+  if (done.size === 0) return;
+  // Re-read so a delete queued while this ran isn't dropped.
+  const latest = await loadPendingSeatDeletes();
+  await saveToCache(
+    CACHE_KEYS.PENDING_SEAT_DELETES,
+    latest.filter(p => !done.has(p.sktLogPekerjaId)),
+  );
+}
+
 /**
  * "Post" — sends every eligible, not-yet-posted setoran of the logged-in
  * user to the server, from the local cache only:
@@ -519,7 +717,8 @@ async function ensureServerSeats(
  *    Giling or Batil seat that wasn't in the previous Get Data is not an
  *    error — it's queued to be added first (step 3); only if its pekerja
  *    has no skt_master_pekerja_id is that setoran held back in `waiting`.
- * 3. Per header: add its new seats via skt/skt_log_pekerja, then
+ * 3. Send seats deleted on the device (see sendPendingSeatDeletes).
+ * 4. Per header: add its new seats via skt/skt_log_pekerja, then
  *    send one setoran POST (the server commits each header atomically).
  *    Only after a header's POST succeeds are its rows flagged `postedAt`
  *    in the cache; a failed header stays unflagged and is retried on the
@@ -533,6 +732,8 @@ export async function postPendingSetoran(
     validationErrors: [],
     waiting: [],
     addedSeats: [],
+    deletedSeats: [],
+    failedDeletes: [],
     posted: [],
     failed: [],
   };
@@ -552,9 +753,12 @@ export async function postPendingSetoran(
       sktDetailCacheKey(header.id),
     );
     if (!cached) continue;
+    const knownMeja = await loadFromCache<number[]>(
+      knownMejaCacheKey(header.id, user.username),
+    );
     const pairs = eligiblePairs(
       cached.workers,
-      getVisibleMejaNumbers(user, cached.workers),
+      withKnownMeja(getVisibleMejaNumbers(user, cached.workers), knownMeja),
     );
     if (pairs.length === 0) continue;
     const ready = prepareHeader(
@@ -571,6 +775,10 @@ export async function postPendingSetoran(
   // Roll back before anything is committed: one invalid setoran anywhere
   // means no header is sent.
   if (result.validationErrors.length > 0) return result;
+
+  // Seat deletes go first, so a seat deleted and then re-added on the
+  // device isn't matched to the old server seat by ensureServerSeats.
+  await sendPendingSeatDeletes(user, createdBy, result);
 
   for (const item of prepared) {
     try {

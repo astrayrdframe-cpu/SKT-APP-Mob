@@ -1,4 +1,4 @@
-import { SKTHeaderItem, SKTDetail, SetoranWorker, SetoranSummary, MejaSummary, PekerjaPair, PekerjaSlot, SetoranEntry, BarcodeTrayRow, TestTempRow } from '../skt';
+import { SKTHeaderItem, SKTDetail, SetoranWorker, SetoranSummary, MejaSummary, PekerjaPair, PekerjaSlot, SetoranEntry, BarcodeTrayRow, MasterBarcodeRow } from '../skt';
 import { loadFromCache, CACHE_KEYS } from '../Offline/persistence';
 import { dedupeById } from '../../utils/dedupe';
 import { pairSetoranByMeja, SetoranPairRow } from '../../utils/mejaGrouping';
@@ -10,8 +10,8 @@ const SKT_HEADER_ENDPOINT =
 const SKT_VIEW_ENDPOINT =
   `${SKT_API_URL}/skt_view`;
 
-const SKT_TEST_TEMP_ENDPOINT =
-  `${SKT_API_URL}/test_temp`;
+const SKT_MASTER_BARCODE_ENDPOINT =
+  `${SKT_API_URL}/skt_master_barcode`;
 
 interface RawOrdsResponse {
   items: Record<string, any>[];
@@ -65,6 +65,9 @@ interface RawHeaderRow {
   // on hand once login (authService.ts) starts returning the current
   // user's own MK id and a visibility filter can compare the two.
   skt_template_header_mk_id: number | null;
+  // Comma-separated MK names this header is assigned to, e.g.
+  // "MK TESTING, MKITRAIN" — null when none is assigned yet.
+  nama_mk_assigned: string | null;
   upah_giling_biasa: number | null; // wage per batang, numeric (Giling) seats
   upah_batil_biasa: number | null; // wage per batang, alpha (Batil) seats
 }
@@ -89,6 +92,15 @@ interface RawViewRow {
   // matched against to decide which meja it can see (see
   // getVisibleMejaNumbers in utils/accessControl.ts).
   mk_id?: number | null;
+  // The mobile user behind mk_id. Note skt_view repeats every seat once per
+  // mobile user of the Brak, so mk_id/username don't say who a meja
+  // belongs to — skt_master_mk_id/mk below do (null when unassigned).
+  username?: string | null;
+  skt_master_mk_id?: string | number | null;
+  mk?: string | null;
+  // Every mk_id skt_view returned for this skt_log_pekerja_id — filled in by
+  // fetchSktViewRows, not by ORDS.
+  mk_ids?: number[];
 }
 
 // Dedup-aware wrappers around fetchAllOrdsRows for skt_header/skt_view —
@@ -107,6 +119,10 @@ async function fetchSktHeaderRows(): Promise<RawHeaderRow[]> {
 // per call. So this fetches each requested Brak separately, in parallel,
 // and merges them.
 async function fetchSktViewRows(brakIds: number[]): Promise<RawViewRow[]> {
+  return collapseViewRows(await fetchRawSktViewRows(brakIds));
+}
+
+async function fetchRawSktViewRows(brakIds: number[]): Promise<RawViewRow[]> {
   const uniqueBrakIds = Array.from(new Set(brakIds));
   const perBrak = await Promise.all(
     uniqueBrakIds.map(
@@ -114,7 +130,24 @@ async function fetchSktViewRows(brakIds: number[]): Promise<RawViewRow[]> {
         fetchAllOrdsRows(`${SKT_VIEW_ENDPOINT}?BRAK_ID=${brakId}`) as Promise<RawViewRow[]>
     )
   );
-  return dedupeById(perBrak.flat(), (r) => r.skt_log_pekerja_id);
+  return perBrak.flat();
+}
+
+function collapseViewRows(rows: RawViewRow[]): RawViewRow[] {
+  // skt_view repeats a seat once per MK assigned to its meja. Collect every
+  // mk_id per seat before deduping, or a meja shared by two MKs would only
+  // stay visible to whichever MK's row happened to come first.
+  const mkIdsBySeat = new Map<number, Set<number>>();
+  for (const r of rows) {
+    if (r.mk_id == null) continue;
+    const set = mkIdsBySeat.get(r.skt_log_pekerja_id) ?? new Set<number>();
+    set.add(r.mk_id);
+    mkIdsBySeat.set(r.skt_log_pekerja_id, set);
+  }
+  return dedupeById(rows, (r) => r.skt_log_pekerja_id).map((r) => ({
+    ...r,
+    mk_ids: Array.from(mkIdsBySeat.get(r.skt_log_pekerja_id) ?? []),
+  }));
 }
 
 // The seats one header has on the server right now (live skt_view, not the
@@ -141,6 +174,41 @@ export async function fetchServerSeats(
 // super user, who sees them all).
 function resolveBrakIds(headerRows: RawHeaderRow[], brakIds?: number[] | null): number[] {
   return brakIds ?? headerRows.map((h) => h.skt_master_brak_id);
+}
+
+const normalizeMkName = (name: string) => name.trim().toUpperCase();
+
+// MK name -> ids, learned from skt_view: each meja's assigned MK
+// (mk / skt_master_mk_id) and each mobile user (username / mk_id).
+// Built from the raw rows, before fetchSktViewRows collapses the
+// per-mobile-user repeats.
+function buildMkIdsByName(viewRows: RawViewRow[]): Map<string, Set<number>> {
+  const byName = new Map<string, Set<number>>();
+  const add = (name: string | null | undefined, id: unknown) => {
+    const num = Number(id);
+    if (!name || !num) return;
+    const key = normalizeMkName(name);
+    byName.set(key, (byName.get(key) ?? new Set<number>()).add(num));
+  };
+  for (const r of viewRows) {
+    add(r.mk, r.skt_master_mk_id);
+    add(r.username, r.mk_id);
+  }
+  return byName;
+}
+
+// skt_header's nama_mk_assigned as names plus the MK ids they resolve to.
+function resolveAssignedMkIds(
+  header: RawHeaderRow,
+  mkIdsByName: Map<string, Set<number>>
+): { mkAssigned: string[]; mkAssignedIds: number[] } {
+  const mkAssigned = (header.nama_mk_assigned ?? '')
+    .split(',')
+    .map(normalizeMkName)
+    .filter(Boolean);
+  const ids = new Set<number>();
+  for (const name of mkAssigned) mkIdsByName.get(name)?.forEach((id) => ids.add(id));
+  return { mkAssigned, mkAssignedIds: Array.from(ids) };
 }
 
 function deriveJenisLabel(jenisGarapanId: string, jumlahGarapanLembur: number): string {
@@ -200,7 +268,9 @@ function injectDualRoleTestRow(workers: SetoranWorker[]): SetoranWorker[] {
  */
 export async function fetchSktHeaderList(brakIds?: number[] | null): Promise<SKTHeaderItem[]> {
   const headerRows = await fetchSktHeaderRows();
-  const viewRows = await fetchSktViewRows(resolveBrakIds(headerRows, brakIds));
+  const rawViewRows = await fetchRawSktViewRows(resolveBrakIds(headerRows, brakIds));
+  const viewRows = collapseViewRows(rawViewRows);
+  const mkIdsByName = buildMkIdsByName(rawViewRows);
 
   return headerRows.map((header): SKTHeaderItem => {
     const relatedViewRows = viewRows.filter((v) => v.skt_header_id === header.id);
@@ -218,6 +288,7 @@ export async function fetchSktHeaderList(brakIds?: number[] | null): Promise<SKT
       tanggal: header.header_date,
       jumlahMeja,
       templateHeaderMkId: header.skt_template_header_mk_id,
+      ...resolveAssignedMkIds(header, mkIdsByName),
       upahGilingBiasa: header.upah_giling_biasa,
       upahBatilBiasa: header.upah_batil_biasa,
     };
@@ -234,7 +305,8 @@ export async function fetchSktHeaderList(brakIds?: number[] | null): Promise<SKT
 // two ORDS endpoints instead of duplicating the mapping logic.
 function buildDetailAndWorkers(
   header: RawHeaderRow,
-  viewRows: RawViewRow[]
+  viewRows: RawViewRow[],
+  mkIdsByName: Map<string, Set<number>>
 ): { detail: SKTDetail; workers: SetoranWorker[] } {
   const relatedRows = viewRows.filter((v) => v.skt_header_id === header.id);
 
@@ -255,6 +327,7 @@ function buildDetailAndWorkers(
     totalSetoran,
     totalSetoranUnit: 'btg', // ASSUMPTION — no unit field in the schema
     templateHeaderMkId: header.skt_template_header_mk_id,
+    ...resolveAssignedMkIds(header, mkIdsByName),
     upahGilingBiasa: header.upah_giling_biasa,
     upahBatilBiasa: header.upah_batil_biasa,
   };
@@ -274,6 +347,7 @@ function buildDetailAndWorkers(
         jamMasuk: row.jam_masuk,
         jamKeluar: row.jam_keluar,
         mkId: row.mk_id ?? null,
+        mkIds: row.mk_ids ?? [],
         upah: row.total ?? 0,
         createdDate: row.created_date,
       }))
@@ -292,9 +366,13 @@ export async function fetchSktDetail(
   if (!header) {
     throw new Error(`No skt_header record found for id=${id}`);
   }
-  const viewRows = await fetchSktViewRows([header.skt_master_brak_id]);
+  const rawViewRows = await fetchRawSktViewRows([header.skt_master_brak_id]);
 
-  return buildDetailAndWorkers(header, viewRows);
+  return buildDetailAndWorkers(
+    header,
+    collapseViewRows(rawViewRows),
+    buildMkIdsByName(rawViewRows)
+  );
 }
 
 /**
@@ -310,76 +388,81 @@ export async function fetchAllSktDetails(brakIds?: number[] | null): Promise<
   Array<{ detail: SKTDetail; workers: SetoranWorker[] }>
 > {
   const headerRows = await fetchSktHeaderRows();
-  const viewRows = await fetchSktViewRows(resolveBrakIds(headerRows, brakIds));
+  const rawViewRows = await fetchRawSktViewRows(resolveBrakIds(headerRows, brakIds));
+  const viewRows = collapseViewRows(rawViewRows);
+  const mkIdsByName = buildMkIdsByName(rawViewRows);
 
-  return headerRows.map((header) => buildDetailAndWorkers(header, viewRows));
+  return headerRows.map((header) => buildDetailAndWorkers(header, viewRows, mkIdsByName));
 }
 
-interface RawTestTempRow {
+interface RawMasterBarcodeRow {
   id: number;
-  name_test: string;
-  created_date: string;
-  created_by: string;
-  updated_date: string | null;
-  updated_by: string | null;
+  code: string;
+  skt_master_brak_id: number;
+  status: string;
+  jumlah_batang: number | null;
 }
 
-function toTestTempRow(row: RawTestTempRow): TestTempRow {
+function toMasterBarcodeRow(row: RawMasterBarcodeRow): MasterBarcodeRow {
   return {
     id: row.id,
-    nameTest: row.name_test,
-    createdDate: row.created_date,
-    createdBy: row.created_by,
-    updatedDate: row.updated_date,
-    updatedBy: row.updated_by,
+    code: row.code,
+    brakId: row.skt_master_brak_id,
+    status: row.status,
+    jumlahBatang: row.jumlah_batang ?? 0,
   };
 }
 
 /**
- * skt/test_temp — a standalone test table, unrelated to any SKT
- * header/meja/pekerja data. Pulled in alongside fetchAllSktDetails during
- * the Dashboard's "Get Data" resync and cached as-is for later use.
+ * skt/skt_master_barcode — the master tray list. Pulled in alongside
+ * fetchAllSktDetails during the Dashboard's "Get Data" resync and cached
+ * whole (every Brak); the per-Brak check happens at scan time, see
+ * findMasterBarcodeByCode.
  */
-export async function fetchTestTempData(): Promise<TestTempRow[]> {
+export async function fetchMasterBarcodeData(): Promise<MasterBarcodeRow[]> {
   const rows = dedupeById(
-    (await fetchAllOrdsRows(SKT_TEST_TEMP_ENDPOINT)) as RawTestTempRow[],
+    (await fetchAllOrdsRows(SKT_MASTER_BARCODE_ENDPOINT)) as RawMasterBarcodeRow[],
     (r) => r.id
   );
-  return rows.map(toTestTempRow);
+  return rows.map(toMasterBarcodeRow);
 }
 
 /**
- * Looks up one scanned "Barcode Tray" code against skt/test_temp — used by
- * BarcodeTrayScanScreen (its own dedicated scanner, separate from
- * AbsensiScanScreenCamera's Pekerja Giling/Batil scan) to verify a scanned
- * code the same way AbsensiScanScreenCamera verifies a scanned NIK against
- * skt_master_pekerja (see findMasterPekerjaByNik in pekerjaApi.ts — same
- * cache-only approach, same reasoning).
+ * Looks up one scanned "Barcode Tray" code against the cached
+ * skt_master_barcode rows (case/whitespace-insensitive match on `code`).
+ * Returns the row whatever its status/Brak — the caller decides whether
+ * it's usable (see BarcodeTrayScanScreenCamera), so it can tell the admin
+ * *why* a recognized tray was rejected.
  *
- * Reads CACHE_KEYS.TEST_TEMP instead of hitting ORDS live — same "no
+ * Reads CACHE_KEYS.MASTER_BARCODE instead of hitting ORDS live — same "no
  * direct GET from a feature screen" rule the rest of the app follows (see
- * loadDetail's disabled GET in SKTHeaderDetailScreen.tsx). That cache is
- * populated by fetchTestTempData() during the Dashboard's "Get Data" sync
- * (see syncAllFromOrds in SKTHeaderDashboardScreen.tsx), so a scan works
- * fully offline between syncs.
- *
- * There's no real master tray/batch table yet (see resolveBarcodeTray
- * below, which still only resolves a batang quantity once a code is
- * already known-good), so test_temp — a standalone test table — stands in
- * as the thing a scanned code gets checked against for now: a match on
- * `nameTest` (case/whitespace-insensitive), or its numeric `id` as a
- * fallback, counts as "recognized". Swap this for a real tray/batch
- * lookup once that table exists.
+ * findMasterPekerjaByNik in pekerjaApi.ts), so a scan works fully offline
+ * between syncs.
  */
-export async function findTestTempRowByCode(code: string): Promise<TestTempRow | null> {
-  const rows = (await loadFromCache<TestTempRow[]>(CACHE_KEYS.TEST_TEMP)) ?? [];
+export async function findMasterBarcodeByCode(code: string): Promise<MasterBarcodeRow | null> {
+  const rows = (await loadFromCache<MasterBarcodeRow[]>(CACHE_KEYS.MASTER_BARCODE)) ?? [];
   const normalized = code.trim().toLowerCase();
+  return rows.find((row) => row.code.trim().toLowerCase() === normalized) ?? null;
+}
 
-  const match = rows.find(
-    (row) => row.nameTest.trim().toLowerCase() === normalized || String(row.id) === code.trim()
-  );
+export type TrayValidation =
+  | { ok: true; tray: MasterBarcodeRow }
+  | { ok: false; reason: 'not-found' | 'inactive' | 'wrong-brak'; tray: MasterBarcodeRow | null };
 
-  return match ?? null;
+/**
+ * A scanned tray is usable only if it exists in skt_master_barcode, is
+ * ACTIVE, and belongs to `brakId` (the current user's Brak). A null
+ * `brakId` (no Brak to compare against) rejects every tray.
+ */
+export async function validateTrayBarcode(
+  code: string,
+  brakId: number | null | undefined
+): Promise<TrayValidation> {
+  const tray = await findMasterBarcodeByCode(code);
+  if (!tray) return { ok: false, reason: 'not-found', tray: null };
+  if (tray.status?.toUpperCase() !== 'ACTIVE') return { ok: false, reason: 'inactive', tray };
+  if (brakId == null || tray.brakId !== brakId) return { ok: false, reason: 'wrong-brak', tray };
+  return { ok: true, tray };
 }
 
 const GILING_CODES = new Set(['1', '2', '3']);
@@ -452,7 +535,7 @@ export function buildSetoranSummary(
       new Set(
         workers
           .filter((w) => w.nomorMeja === nomorMeja)
-          .map((w) => w.mkId)
+          .flatMap((w) => [w.mkId, ...(w.mkIds ?? [])])
           .filter((v): v is number => v != null)
       )
     );
@@ -509,6 +592,8 @@ export interface AddPekerjaPayload {
   nik: string; // the field the ORDS module keys the lookup/insert on
   namaPekerja: string;
   nomorAbsen: string;
+  jamMasuk: string; // "HH:mm" clock-in picked in Tambah Pekerja
+  jamKeluar: string; // "HH:mm" clock-out picked in Tambah Pekerja
 }
 
 /**
@@ -570,6 +655,8 @@ async function submitAddPekerja(payload: AddPekerjaPayload): Promise<SetoranWork
       nik: payload.nik,
       nama_pekerja: payload.namaPekerja,
       nomor_absen: payload.nomorAbsen,
+      jam_masuk: payload.jamMasuk,
+      jam_keluar: payload.jamKeluar,
     }),
   });
 
@@ -586,6 +673,8 @@ async function submitAddPekerja(payload: AddPekerjaPayload): Promise<SetoranWork
   return {
     id: data.id ?? data.skt_log_pekerja_id,
     masterPekerjaId: payload.masterPekerjaId,
+    shiftJamMasuk: payload.jamMasuk,
+    shiftJamKeluar: payload.jamKeluar,
     kodeSetoran: payload.kode,
     namaPekerja: payload.namaPekerja,
     nomorAbsen: payload.nomorAbsen,
@@ -610,6 +699,8 @@ async function addPekerjaLocalCache(payload: AddPekerjaPayload): Promise<Setoran
   return {
     id: -Date.now(),
     masterPekerjaId: payload.masterPekerjaId,
+    shiftJamMasuk: payload.jamMasuk,
+    shiftJamKeluar: payload.jamKeluar,
     kodeSetoran: payload.kode,
     namaPekerja: payload.namaPekerja,
     nomorAbsen: payload.nomorAbsen,
@@ -645,18 +736,6 @@ export async function addPekerjaToMeja(payload: AddPekerjaPayload): Promise<Seto
 // are filled in and confirmed with the backend team.
 export const USE_LOCAL_SETORAN_CACHE = true;
 
-// TODO: replace with the real GET endpoint once confirmed with the backend team.
-// ASSUMPTION: a scanned tray barcode resolves against some master
-// tray/batch table keyed by its printed code — no such table has shown up
-// in the schema yet, so this is a placeholder contract (code in, batang
-// count out). Note this only runs for a code that's already been verified
-// against skt/test_temp inside BarcodeTrayScanScreen (see
-// findTestTempRowByCode above) — that's the "compare against the API"
-// step; this one just figures out the batang quantity for a code already
-// known-good.
-const SKT_BARCODE_TRAY_RESOLVE_ENDPOINT =
-  `${SKT_API_URL}/TODO_REPLACE_ME_BARCODE_TRAY`;
-
 // TODO: replace with the real POST endpoint once confirmed with the backend team.
 const SKT_LOG_SETORAN_ADD_ENDPOINT =
   `${SKT_API_URL}/TODO_REPLACE_ME_SETORAN_ADD`;
@@ -670,41 +749,21 @@ const SKT_LOG_SETORAN_UPDATE_ENDPOINT =
   `${SKT_API_URL}/TODO_REPLACE_ME_SETORAN_UPDATE`;
 
 /**
- * TEMPLATE — real lookup for one scanned tray barcode. Returns the batang
- * (stem) count that barcode represents so the admin never types a
- * quantity by hand.
+ * Entry point Tambah Setoran's "+ Scan to Add" calls — resolves a scanned
+ * tray code to its batang (stem) count from skt_master_barcode's
+ * `jumlah_batang`, so the admin never types a quantity by hand. Re-runs
+ * the same checks as the scanner (exists, ACTIVE, same Brak) and throws
+ * if any fails.
  */
-async function resolveBarcodeTrayRemote(code: string): Promise<BarcodeTrayRow> {
-  const response = await fetch(
-    `${SKT_BARCODE_TRAY_RESOLVE_ENDPOINT}?code=${encodeURIComponent(code)}`
-  );
-
-  if (!response.ok) {
-    throw new Error(`Barcode ${code} tidak dikenali (status ${response.status})`);
+export async function resolveBarcodeTray(
+  code: string,
+  brakId: number | null | undefined
+): Promise<BarcodeTrayRow> {
+  const result = await validateTrayBarcode(code, brakId);
+  if (!result.ok) {
+    throw new Error(`Barcode ${code} tidak valid (${result.reason})`);
   }
-
-  const data = await response.json();
-  return { code, batang: data.batang ?? data.jumlah_batang ?? 0 };
-}
-
-/**
- * Local-only resolve — no master tray table to check against yet, so this
- * every recognized tray counts as a fixed TRAY_BATANG batang, after a
- * short simulated delay.
- */
-const TRAY_BATANG = 250;
-
-async function resolveBarcodeTrayLocalCache(code: string): Promise<BarcodeTrayRow> {
-  await new Promise<void>((resolve) => setTimeout(resolve, 300));
-  return { code, batang: TRAY_BATANG };
-}
-
-/** Entry point Tambah Setoran's "+ Scan to Add" should call. */
-export async function resolveBarcodeTray(code: string): Promise<BarcodeTrayRow> {
-  if (USE_LOCAL_SETORAN_CACHE) {
-    return resolveBarcodeTrayLocalCache(code);
-  }
-  return resolveBarcodeTrayRemote(code);
+  return { code: result.tray.code, batang: result.tray.jumlahBatang };
 }
 
 interface SetoranPekerjaInput {

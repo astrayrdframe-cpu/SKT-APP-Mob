@@ -1,6 +1,6 @@
 // Removes rows sharing the same id, keeping the FIRST occurrence. Applied
 // right after every raw ORDS fetch (skt_header, skt_view,
-// skt_master_pekerja, skt/test_temp — see sktApi.ts and pekerjaApi.ts) so a
+// skt_master_pekerja, skt_master_barcode — see sktApi.ts and pekerjaApi.ts) so a
 // dirty view/join on the backend, or a pagination overlap in
 // fetchAllOrdsRows, never surfaces downstream as duplicate cards/rows —
 // duplicate SKT Header entries on the Dashboard list, duplicate pekerja

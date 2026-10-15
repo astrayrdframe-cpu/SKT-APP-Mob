@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug builds only: cleartext everywhere, so the app can load its JS
+     bundle from Metro (localhost / the dev machine) as well as reach the
+     plain-http ORDS API. Release builds use src/main/res/xml instead. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

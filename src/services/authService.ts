@@ -1,25 +1,31 @@
 // src/services/authService.ts
 import AsyncStorage from '@react-native-async-storage/async-storage'; // Use the correct AsyncStorage import
 import axiosInstance from '../config/axiosInstance';
+import { API_BASE_URL } from '../config/api';
 import Toast from 'react-native-toast-message';
 
-// Matches what the ORDS `/auth/login` endpoint's PL/SQL actually returns:
+// Matches what the ORDS `/auth/login` endpoint's PL/SQL actually returns.
+// The request is { "email", "password" } — the endpoint no longer accepts
+// a username ("Email dan password wajib diisi" if email is missing):
 // { "status": "success", "message": "Login berhasil",
-//   "data": { "token": "...", "username": "...", "role": "ADMIN" | "MK",
-//              "nama_brak": "...", "mk_id": number | null,
-//              "brak_id": number | null, "must_change_password": 0 | 1,
+//   "data": { "token": "...", "email": "...", "username": "...",
+//              "role": "ADMIN" | "MK", "nama_brak": "...",
+//              "mk_id": number | null, "brak_id": number | null,
+//              "must_change_password": 0 | 1, "sudah_change_password": 0 | 1,
 //              "expired_date": "2026-08-05T16:07:24" } }
 interface LoginResponse {
   status: 'success' | 'error' | string;
   message: string;
   data: {
     token: string;
+    email: string;
     username: string;
     role: 'ADMIN' | 'MK' | string;
     nama_brak: string;
     mk_id: number | null;
     brak_id: number | null;
     must_change_password: number;
+    sudah_change_password: number;
     expired_date: string;
   };
 }
@@ -27,12 +33,12 @@ interface LoginResponse {
 class AuthServices {
   // Login function: Accepts credentials, performs authentication, stores the token, and saves user info
   static async login(
-    username: string,
+    email: string,
     password: string,
   ): Promise<LoginResponse> {
     try {
       const response = await axiosInstance.post<LoginResponse>('/auth/login', {
-        username,
+        email,
         password,
       });
 
@@ -58,6 +64,37 @@ class AuthServices {
     }
   }
 
+
+  // POST auth/change_password — changes the password of the account the
+  // login token belongs to. Body { old_password, new_password }, token as
+  // "Authorization: Bearer <token>". Like auth/login, a rejection comes back
+  // as HTTP 200 + { "status": "error", "message": ... } (e.g. "Token tidak
+  // valid atau sudah expired"), so the payload is checked, not just the
+  // status code. Uses fetch rather than axiosInstance on purpose: its request
+  // interceptor overwrites Authorization with the stored session token, and
+  // an account that must change its password has no stored session yet.
+  static async changePassword(
+    token: string,
+    oldPassword: string,
+    newPassword: string,
+  ): Promise<string> {
+    const response = await fetch(`${API_BASE_URL}/auth/change_password`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        old_password: oldPassword,
+        new_password: newPassword,
+      }),
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok || data?.status !== 'success') {
+      throw new Error(data?.message || `HTTP ${response.status}`);
+    }
+    return data?.message || 'Kata sandi berhasil diubah';
+  }
 
   // Get token: Retrieves the token from AsyncStorage
   static async getToken(): Promise<string | null> {

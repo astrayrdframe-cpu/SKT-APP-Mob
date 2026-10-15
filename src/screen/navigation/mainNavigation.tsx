@@ -59,12 +59,14 @@ export type RootStackParamList = {
     | undefined;
   // Dedicated scanner for Tambah Setoran's "+ Scan to Add" (Barcode Tray)
   // — separate from AbsensiScan since it verifies a scanned code against
-  // skt/test_temp, not skt_master_pekerja (see BarcodeTrayScanScreenCamera).
-  // onScannedCode fires once a scanned code is confirmed against test_temp
-  // and the admin taps "Gunakan"; onCancelled fires if the scanner closes
-  // any other way, same "always reopens the caller" contract as AbsensiScan.
+  // skt_master_barcode, not skt_master_pekerja (see BarcodeTrayScanScreenCamera).
+  // onScannedCode fires once a scanned code is confirmed (exists, ACTIVE,
+  // and belongs to `brakId`) and the admin taps "Gunakan"; onCancelled
+  // fires if the scanner closes any other way, same "always reopens the
+  // caller" contract as AbsensiScan.
   BarcodeTrayScan:
     | {
+        brakId?: number | null; // only trays of this Brak are accepted
         onScannedCode?: (code: string) => void;
         onCancelled?: () => void;
       }

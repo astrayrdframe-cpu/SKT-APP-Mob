@@ -19,6 +19,15 @@ import { isNumericCode } from '../../../utils/pekerjaRole';
 // ever in use at the same time.
 const ALL_CODES = ['1', '2', '3', 'A', 'B'];
 
+// Jam Masuk / Jam Keluar options ("HH:mm") — in-tree dropdown rather than
+// a native picker dialog, for the same z-order reason as errorMessage below.
+const HOURS = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0'));
+const MINUTES = Array.from({ length: 12 }, (_, i) => String(i * 5).padStart(2, '0'));
+const DEFAULT_JAM_MASUK = '06:00';
+const DEFAULT_JAM_KELUAR = '14:00';
+
+type TimeField = 'masuk' | 'keluar';
+
 // True once a pekerja already holds one numeric (giling) code AND one
 // alpha (batil) code in this meja — at that point they're fully occupied
 // and can't take on a third role here. Identity is keyed on `detailPekerja`
@@ -63,7 +72,7 @@ interface TambahPekerjaModalProps {
   mejaGroups: MejaGroup[]; // every meja in this SKT header — used to block adding a pekerja who's already seated at a different meja
   scannedPekerja?: MasterPekerja | null; // result handed back from AbsensiScanScreen after a QR scan
   onPressScan: () => void; // navigates to the attendance QR scanner
-  onSubmit: (pekerja: MasterPekerja, kode: string) => void;
+  onSubmit: (pekerja: MasterPekerja, kode: string, jamMasuk: string, jamKeluar: string) => void;
 }
 
 export default function TambahPekerjaModal({
@@ -87,6 +96,10 @@ export default function TambahPekerjaModal({
 
   const [isKodeDropdownOpen, setIsKodeDropdownOpen] = useState(false);
   const [selectedKode, setSelectedKode] = useState<string | null>(null);
+
+  const [jamMasuk, setJamMasuk] = useState(DEFAULT_JAM_MASUK);
+  const [jamKeluar, setJamKeluar] = useState(DEFAULT_JAM_KELUAR);
+  const [openTimeField, setOpenTimeField] = useState<TimeField | null>(null);
 
   // Rendered in-tree (below) instead of Alert.alert — Alert.alert opens a
   // separate native OS dialog window, which on Android can land BEHIND this
@@ -191,6 +204,9 @@ export default function TambahPekerjaModal({
     setIsDropdownOpen(false);
     setSelectedKode(null);
     setIsKodeDropdownOpen(false);
+    setJamMasuk(DEFAULT_JAM_MASUK);
+    setJamKeluar(DEFAULT_JAM_KELUAR);
+    setOpenTimeField(null);
   };
 
   // Typing clears any prior selection — Kode Pekerja availability depends
@@ -227,6 +243,20 @@ export default function TambahPekerjaModal({
     setIsKodeDropdownOpen(false);
   };
 
+  const toggleTimeField = (field: TimeField) => {
+    setIsKodeDropdownOpen(false);
+    setOpenTimeField((open) => (open === field ? null : field));
+  };
+
+  // Replaces just the hour or minute half of the open field's "HH:mm".
+  const handleSelectTime = (part: 'hour' | 'minute', value: string) => {
+    const setter = openTimeField === 'masuk' ? setJamMasuk : setJamKeluar;
+    setter((current) => {
+      const [h, m] = current.split(':');
+      return part === 'hour' ? `${value}:${m}` : `${h}:${value}`;
+    });
+  };
+
   const handleClose = () => {
     resetState();
     setErrorMessage(null);
@@ -235,7 +265,7 @@ export default function TambahPekerjaModal({
 
   const handleTambah = () => {
     if (!selectedPekerja || !selectedKode) return;
-    onSubmit(selectedPekerja, selectedKode);
+    onSubmit(selectedPekerja, selectedKode, jamMasuk, jamKeluar);
     resetState();
   };
 
@@ -326,14 +356,17 @@ export default function TambahPekerjaModal({
           <Text style={[styles.fieldLabel, styles.kodeFieldLabel]}>Kode Pekerja</Text>
           <TouchableOpacity
             style={styles.kodeBox}
-            onPress={() => selectedPekerja && setIsKodeDropdownOpen((open) => !open)}
+            onPress={() => {
+              if (!selectedPekerja) return;
+              setOpenTimeField(null);
+              setIsKodeDropdownOpen((open) => !open);
+            }}
             activeOpacity={0.8}
             disabled={!selectedPekerja}
           >
             {selectedKode ? (
               <View style={styles.kodeSelectedRow}>
                 <KodeBadge code={selectedKode} />
-                <Text style={styles.kodeSelectedText}>{selectedKode}</Text>
               </View>
             ) : (
               <Text style={styles.kodePlaceholder}>
@@ -363,6 +396,62 @@ export default function TambahPekerjaModal({
                   ))}
                 </View>
               )}
+            </View>
+          )}
+
+          <View style={styles.timeRow}>
+            {(['masuk', 'keluar'] as TimeField[]).map((field) => (
+              <View key={field} style={styles.timeColumn}>
+                <Text style={styles.fieldLabel}>
+                  {field === 'masuk' ? 'Jam Masuk' : 'Jam Keluar'}
+                </Text>
+                <TouchableOpacity
+                  style={[styles.timeBox, openTimeField === field && styles.timeBoxActive]}
+                  onPress={() => toggleTimeField(field)}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.timeValue}>
+                    {field === 'masuk' ? jamMasuk : jamKeluar}
+                  </Text>
+                  <Text style={styles.kodeChevron}>🕒</Text>
+                </TouchableOpacity>
+              </View>
+            ))}
+          </View>
+
+          {openTimeField && (
+            <View style={[styles.dropdown, styles.timeDropdown]}>
+              {(['hour', 'minute'] as const).map((part) => {
+                const current = (openTimeField === 'masuk' ? jamMasuk : jamKeluar).split(':')[
+                  part === 'hour' ? 0 : 1
+                ];
+                return (
+                  <ScrollView
+                    key={part}
+                    style={styles.timeScroll}
+                    keyboardShouldPersistTaps="handled"
+                    nestedScrollEnabled
+                  >
+                    {(part === 'hour' ? HOURS : MINUTES).map((value) => (
+                      <TouchableOpacity
+                        key={value}
+                        style={[styles.timeOption, value === current && styles.timeOptionActive]}
+                        onPress={() => handleSelectTime(part, value)}
+                        activeOpacity={0.7}
+                      >
+                        <Text
+                          style={[
+                            styles.timeOptionText,
+                            value === current && styles.timeOptionTextActive,
+                          ]}
+                        >
+                          {value}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </ScrollView>
+                );
+              })}
             </View>
           )}
 
@@ -526,7 +615,6 @@ const styles = StyleSheet.create({
     marginBottom: 18,
   },
   kodeSelectedRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  kodeSelectedText: { fontSize: 12, fontWeight: '600', color: '#101828' },
   kodePlaceholder: { fontSize: 12, color: '#98A2B3' },
   kodeChevron: { fontSize: 12, color: '#667085' },
   kodeDropdown: { marginBottom: 18, marginTop: -10 },
@@ -542,6 +630,26 @@ const styles = StyleSheet.create({
   kodeBadgeBlue: { backgroundColor: '#2F5FD1' },
   kodeBadgePurple: { backgroundColor: '#7C3AED' },
   kodeBadgeText: { fontSize: 13, fontWeight: '700', color: '#FFFFFF' },
+  timeRow: { flexDirection: 'row', gap: 10, marginBottom: 18 },
+  timeColumn: { flex: 1 },
+  timeBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderWidth: 1,
+    borderColor: '#D0D5DD',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    height: 40,
+  },
+  timeBoxActive: { borderColor: '#2F5FD1' },
+  timeValue: { fontSize: 12, fontWeight: '600', color: '#101828' },
+  timeDropdown: { flexDirection: 'row', marginTop: -14, marginBottom: 18 },
+  timeScroll: { flex: 1, maxHeight: 150 },
+  timeOption: { paddingVertical: 8, alignItems: 'center' },
+  timeOptionActive: { backgroundColor: '#EEF4FF' },
+  timeOptionText: { fontSize: 12, color: '#344054' },
+  timeOptionTextActive: { fontWeight: '700', color: '#2F5FD1' },
   buttonRow: { flexDirection: 'row', gap: 10 },
   batalButton: {
     flex: 1,

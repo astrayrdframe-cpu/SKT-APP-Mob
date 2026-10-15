@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The ORDS API (REACT_NATIVE_API_URL) is plain http://, which release
+     builds otherwise block (the React Native Gradle plugin sets
+     usesCleartextTraffic=false for release). Allow cleartext for that host
+     only; everything else stays HTTPS-only. Debug builds override this file
+     (src/debug/res/xml) to also allow Metro on localhost. -->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">apps.nti-skt.net</domain>
+    </domain-config>
+</network-security-config>

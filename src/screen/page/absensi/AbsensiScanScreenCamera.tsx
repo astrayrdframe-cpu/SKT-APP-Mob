@@ -4,8 +4,8 @@ import { useNavigation, useRoute, useIsFocused, RouteProp } from '@react-navigat
 import { useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
 import { CodeScanner, Barcode } from 'react-native-vision-camera-barcode-scanner';
 import type { RootStackParamList } from '../../navigation/mainNavigation';
-import { findMasterPekerjaByNik } from '../../../services/API/pekerjaApi';
-import { extractNikFromScan, MasterPekerja } from '../../../services/pekerja';
+import { findMasterPekerjaByBadge } from '../../../services/API/pekerjaApi';
+import { MasterPekerja, parseBadgeScan, ScannedBadge } from '../../../services/pekerja';
 
 type ScanState = 'no-permission' | 'no-device' | 'idle' | 'verifying' | 'success' | 'not-found';
 
@@ -65,6 +65,9 @@ export default function AbsensiScanScreen() {
 
   const [scanState, setScanState] = useState<ScanState>(hasPermission ? 'idle' : 'no-permission');
   const [scannedNik, setScannedNik] = useState<string | null>(null);
+  // The parsed worker badge ID (pekerja mode only) — shown on a failed
+  // match so the admin can see which part didn't line up.
+  const [scannedBadge, setScannedBadge] = useState<ScannedBadge | null>(null);
   const [matchedPekerja, setMatchedPekerja] = useState<MasterPekerja | null>(null);
 
   // Bumped on every "Coba Lagi" tap to force CodeScannerErrorBoundary to
@@ -120,12 +123,15 @@ export default function AbsensiScanScreen() {
     // Badges now encode "nomor_absen - nama_pekerja - nik" (detail_pekerja),
     // not a bare NIK — pull just the NIK back out before looking it up.
     // Older badges with no " - " separator pass through unchanged.
-    const nik = extractNikFromScan(rawValue);
-    setScannedNik(nik);
+    // Current badges encode the ID "<brak_id>-<nomor_absen>-<nik>" (e.g.
+    // "0003-IT006-999999994"); all three must match the same master row.
+    const badge = parseBadgeScan(rawValue);
+    setScannedBadge(badge);
+    setScannedNik(badge.raw);
     setScanState('verifying');
 
     try {
-      const pekerja = await findMasterPekerjaByNik(nik);
+      const pekerja = await findMasterPekerjaByBadge(badge);
       if (pekerja) {
         setMatchedPekerja(pekerja);
         setScanState('success');
@@ -166,6 +172,7 @@ export default function AbsensiScanScreen() {
   const resetToIdle = () => {
     isProcessingRef.current = false;
     setScannedNik(null);
+    setScannedBadge(null);
     setMatchedPekerja(null);
     setScanState('idle');
   };
@@ -291,7 +298,7 @@ export default function AbsensiScanScreen() {
         {scanState === 'verifying' && (
           <View style={styles.centeredRow}>
             <ActivityIndicator color="#2F5FD1" />
-            <Text style={styles.verifyingText}>Memverifikasi NIK {scannedNik}...</Text>
+            <Text style={styles.verifyingText}>Memverifikasi ID {scannedNik}...</Text>
           </View>
         )}
 
@@ -337,9 +344,13 @@ export default function AbsensiScanScreen() {
             <View style={styles.errorIconCircle}>
               <Text style={styles.errorIconText}>✕</Text>
             </View>
-            <Text style={styles.errorTitle}>NIK Tidak Ditemukan</Text>
+            <Text style={styles.errorTitle}>Pekerja Tidak Ditemukan</Text>
             <Text style={styles.errorSubtitle}>
-              NIK {scannedNik} belum terdaftar. Coba scan ulang atau hubungi admin.
+              ID {scannedNik} belum terdaftar
+              {scannedBadge?.brakId != null
+                ? ` (Brak ${scannedBadge.brakId}, Absen ${scannedBadge.nomorAbsen}, NIK ${scannedBadge.nik})`
+                : ''}
+              . Coba scan ulang, jalankan Get Data, atau hubungi admin.
             </Text>
             <TouchableOpacity style={styles.primaryButton} onPress={resetToIdle} activeOpacity={0.85}>
               <Text style={styles.primaryButtonText}>Coba Lagi</Text>

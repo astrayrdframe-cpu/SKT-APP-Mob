@@ -12,10 +12,14 @@ import {
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import Icon from 'react-native-vector-icons/FontAwesome5';
-import { fetchAllSktDetails, fetchTestTempData } from '../../../services/API/sktApi';
-import { hasPostedSetoran, postPendingSetoran } from '../../../services/API/setoranPost';
+import { fetchAllSktDetails, fetchMasterBarcodeData } from '../../../services/API/sktApi';
+import {
+  hasPostedSetoran,
+  loadPendingSeatDeletes,
+  postPendingSetoran,
+} from '../../../services/API/setoranPost';
 import { fetchMasterPekerja } from '../../../services/API/pekerjaApi';
-import { SKTHeaderItem, SKTDetail, SetoranWorker, TestTempRow } from '../../../services/skt';
+import { SKTHeaderItem, SKTDetail, SetoranWorker, MasterBarcodeRow } from '../../../services/skt';
 import { dedupeById } from '../../../utils/dedupe';
 import { canAccessHeader, getBrakScope } from '../../../utils/accessControl';
 import {
@@ -49,7 +53,7 @@ function greetingForHour(hour: number): string {
 }
 
 // Plain JSON-shape equality — every value that flows through here (SKT
-// list items, detail/workers pairs, test_temp rows) is a serializable
+// list items, detail/workers pairs, master barcode rows) is a serializable
 // object built the same way on every fetch, so a stringify compare is
 // enough to tell "actually changed" from "same data came back again".
 function isSameCachedValue(a: unknown, b: unknown): boolean {
@@ -204,13 +208,21 @@ export default function SKTHeaderDashboardScreen() {
 
   // "Get Data" (Sinkronisasi Data → confirmed) — a full resync from ORDS,
   // not just the summary list loadData() pulls for pull-to-refresh. Fetches
-  // every header's detail + worker rows in one pass via fetchAllSktDetails
-  // and REPLACES the cache with it — overwriting each header's cached
-  // detail (so SKTHeaderDetailScreen's offline cache is current too), and
-  // deleting any cached detail whose id isn't in this fetch anymore, so a
-  // record removed server-side doesn't linger locally after a sync. This
-  // is the live GET that loadDetail there leaves commented out, run for
-  // every record at once from here instead.
+  // every header's detail + worker rows in one pass via fetchAllSktDetails.
+  // Rules:
+  //   1. A header with NO posted transaction is replaced entirely by the
+  //      API data (header item and every worker/setoran row), and deleted
+  //      if the server no longer returns it.
+  //      A header WITH a posted transaction is locked: left exactly as
+  //      cached and never deleted, so posted data is never pulled back down
+  //      or posted twice. It still takes new setoran / pekerja, which Post
+  //      sends as usual.
+  //   2. A login new to this device (no Get Data history here and no
+  //      transaction in the cached headers it can access) only pulls
+  //      today's headers (server date); other cached headers are left as
+  //      they are.
+  // This is the live GET that loadDetail there leaves commented out, run
+  // for every record at once from here instead.
   const syncAllFromOrds = useCallback(async () => {
     setIsRefreshing(true);
     setError(null);
@@ -224,11 +236,42 @@ export default function SKTHeaderDashboardScreen() {
       // The previously-cached list — the staleIds sweep below diffs against
       // it to clean up cache entries for headers no longer on the server.
       const previousList = (await loadFromCache<SKTHeaderItem[]>(CACHE_KEYS.SKT_LIST)) ?? [];
+
+      // Rule 1 lock: headers holding any posted setoran (see
+      // hasPostedSetoran in setoranPost.ts). Also notes, for rule 2, whether
+      // this login has any transaction in the headers it can access.
+      const lockedIds = new Set<number>();
+      let userHasTransactions = false;
+      for (const item of previousList) {
+        const cachedDetail = await loadFromCache<{ detail: SKTDetail; workers: SetoranWorker[] }>(
+          sktDetailCacheKey(item.id)
+        );
+        if (hasPostedSetoran(cachedDetail?.workers)) lockedIds.add(item.id);
+        if (canAccessHeader(user, item) && cachedDetail?.workers.some((w) => !!w.transactionId)) {
+          userHasTransactions = true;
+        }
+      }
+
       // Every header is kept, including ones with no skt_view rows (no meja
       // yet) — an MK must still see a header for their Brak before any meja
       // has been assigned to them (see canAccessHeader in
       // utils/accessControl.ts).
-      const details = await fetchAllSktDetails(getBrakScope(user));
+      const allDetails = await fetchAllSktDetails(getBrakScope(user));
+
+      // Rule 2: a login new to this device pulls today's headers only.
+      const today = startOfDay(getServerNow());
+      const isToday = (item: SKTHeaderItem) => isSameDay(new Date(item.tanggal), today);
+      const syncedUsers =
+        (await loadFromCache<Record<string, string>>(CACHE_KEYS.SYNCED_USERS)) ?? {};
+      const userKey = user?.username ?? '';
+      const todayOnly = !syncedUsers[userKey] && !userHasTransactions;
+      const details = todayOnly ? allDetails.filter(({ detail }) => isToday(detail)) : allDetails;
+      // A today-only pull leaves every other cached header (another login's
+      // data, older dates) exactly as it is — not replaced, not deleted.
+      const untouchedIds = new Set(
+        todayOnly ? previousList.filter((item) => !isToday(item)).map((item) => item.id) : []
+      );
+
       // fetchAllSktDetails already dedupes skt_header/skt_view at the fetch
       // boundary (see fetchSktHeaderRows/fetchSktViewRows in sktApi.ts), but
       // this list/each detail's `workers` gets one more explicit pass right
@@ -239,44 +282,20 @@ export default function SKTHeaderDashboardScreen() {
         details.map(({ detail }) => detail),
         (item) => item.id
       );
-
-      // Headers holding any posted setoran are locked: Get Data must not
-      // replace or delete them (see hasPostedSetoran in setoranPost.ts).
-      // They keep their cached header item and detail exactly as they are,
-      // even if the server copy changed or disappeared.
-      const lockedIds = new Set<number>();
-      for (const item of previousList) {
-        const cachedDetail = await loadFromCache<{ detail: SKTDetail; workers: SetoranWorker[] }>(
-          sktDetailCacheKey(item.id)
-        );
-        if (hasPostedSetoran(cachedDetail?.workers)) lockedIds.add(item.id);
-      }
       const freshIds = new Set(freshList.map((item) => item.id));
-      // A locked header keeps its cached item, except for the wage rates —
-      // header master data, not transactions — which are refreshed so the
-      // Summary's Upah stays correct (see buildSetoranSummary).
-      const withFreshRates = <T extends SKTHeaderItem>(cachedItem: T, fresh: SKTHeaderItem): T => ({
-        ...cachedItem,
-        upahGilingBiasa: fresh.upahGilingBiasa,
-        upahBatilBiasa: fresh.upahBatilBiasa,
-      });
       const list: SKTHeaderItem[] = [
         ...freshList.map((item) => {
-          if (!lockedIds.has(item.id)) return item;
-          const cachedItem = previousList.find((p) => p.id === item.id);
-          return cachedItem ? withFreshRates(cachedItem, item) : item;
+          const previous = lockedIds.has(item.id)
+            ? previousList.find((p) => p.id === item.id)
+            : undefined;
+          return previous
+            ? { ...previous, mkAssigned: item.mkAssigned, mkAssignedIds: item.mkAssignedIds }
+            : item;
         }),
-        ...previousList.filter((item) => lockedIds.has(item.id) && !freshIds.has(item.id)),
+        ...previousList.filter(
+          (item) => (lockedIds.has(item.id) || untouchedIds.has(item.id)) && !freshIds.has(item.id)
+        ),
       ];
-      // Same rate-only refresh for each locked header's cached detail.
-      for (const { detail } of details) {
-        if (!lockedIds.has(detail.id)) continue;
-        const key = sktDetailCacheKey(detail.id);
-        const cachedDetail = await loadFromCache<{ detail: SKTDetail; workers: SetoranWorker[] }>(key);
-        if (cachedDetail) {
-          await saveToCache(key, { ...cachedDetail, detail: withFreshRates(cachedDetail.detail, detail) });
-        }
-      }
 
       setItems(list);
 
@@ -291,6 +310,12 @@ export default function SKTHeaderDashboardScreen() {
         await saveToCache(CACHE_KEYS.SKT_LIST, list);
       }
 
+      // Rule 1: every unlocked header is replaced by the API data — minus
+      // seats deleted on the device whose delete hasn't been Posted yet,
+      // so they don't come back before the server drops them.
+      const pendingDeleteIds = new Set(
+        (await loadPendingSeatDeletes()).map((p) => p.sktLogPekerjaId)
+      );
       await Promise.all(
         details
           .filter(({ detail }) => !lockedIds.has(detail.id))
@@ -299,7 +324,13 @@ export default function SKTHeaderDashboardScreen() {
             const previousDetail = await loadFromCache<{ detail: SKTDetail; workers: SetoranWorker[] }>(
               cacheKey
             );
-            const freshDetail = { detail, workers: dedupeById(workers, (w) => w.id) };
+            const freshDetail = {
+              detail,
+              workers: dedupeById(
+                workers.filter((w) => !pendingDeleteIds.has(w.sktLogPekerjaId ?? w.id)),
+                (w) => w.id
+              ),
+            };
             if (!isSameCachedValue(previousDetail, freshDetail)) {
               await saveToCache(cacheKey, freshDetail);
             }
@@ -307,21 +338,30 @@ export default function SKTHeaderDashboardScreen() {
       );
 
       const staleIds = previousList
-        .filter((item) => !freshIds.has(item.id) && !lockedIds.has(item.id))
+        .filter(
+          (item) => !freshIds.has(item.id) && !lockedIds.has(item.id) && !untouchedIds.has(item.id)
+        )
         .map((item) => item.id);
       await Promise.all(staleIds.map((id) => removeFromCache(sktDetailCacheKey(id))));
+      // This login now has cached data on this device.
+      if (userKey) {
+        await saveToCache(CACHE_KEYS.SYNCED_USERS, {
+          ...syncedUsers,
+          [userKey]: new Date().toISOString(),
+        });
+      }
 
-      // skt/test_temp is an unrelated standalone table — fetched and
-      // compared alongside the real resync, but its failure shouldn't fail
-      // (or fall back) the SKT data above, so it gets its own try/catch.
+      // skt_master_barcode (tray master) — fetched alongside the real
+      // resync, but its failure shouldn't fail (or fall back) the SKT data
+      // above, so it gets its own try/catch.
       try {
-        const previousTestTemp = await loadFromCache<TestTempRow[]>(CACHE_KEYS.TEST_TEMP);
-        const testTempRows = dedupeById(await fetchTestTempData(), (r) => r.id);
-        if (!isSameCachedValue(previousTestTemp, testTempRows)) {
-          await saveToCache(CACHE_KEYS.TEST_TEMP, testTempRows);
+        const previousBarcodes = await loadFromCache<MasterBarcodeRow[]>(CACHE_KEYS.MASTER_BARCODE);
+        const barcodeRows = dedupeById(await fetchMasterBarcodeData(), (r) => r.id);
+        if (!isSameCachedValue(previousBarcodes, barcodeRows)) {
+          await saveToCache(CACHE_KEYS.MASTER_BARCODE, barcodeRows);
         }
-      } catch (testTempError) {
-        console.warn('Failed to refresh skt/test_temp:', testTempError);
+      } catch (barcodeError) {
+        console.warn('Failed to refresh skt_master_barcode:', barcodeError);
       }
     } catch {
       // Fall back to the last cached list — likely offline, or the
@@ -350,7 +390,8 @@ export default function SKTHeaderDashboardScreen() {
     setIsRefreshing(true);
     setError(null);
     try {
-      const { validationErrors, waiting, addedSeats, posted, failed } = await postPendingSetoran(user);
+      const { validationErrors, waiting, addedSeats, deletedSeats, failedDeletes, posted, failed } =
+        await postPendingSetoran(user);
       const sum = (rows: { setoranCount: number }[]) => rows.reduce((n, r) => n + r.setoranCount, 0);
       // New Giling seats added to the server before their setoran, plus
       // setoran held back because their new seat couldn't be added — not
@@ -361,6 +402,12 @@ export default function SKTHeaderDashboardScreen() {
           : '') +
         (waiting.length > 0
           ? `\n\n${waiting.length} setoran menunggu (pekerja baru tidak bisa ditambahkan ke server):\n${waiting.map((w) => `• ${w}`).join('\n')}`
+          : '') +
+        (deletedSeats.length > 0
+          ? `\n\n${deletedSeats.length} pekerja dihapus dari server:\n${deletedSeats.map((s) => `• ${s}`).join('\n')}`
+          : '') +
+        (failedDeletes.length > 0
+          ? `\n\n${failedDeletes.length} pekerja gagal dihapus dari server (akan dicoba lagi pada Post berikutnya):\n${failedDeletes.map((s) => `• ${s}`).join('\n')}`
           : '');
 
       if (validationErrors.length > 0) {
@@ -369,7 +416,14 @@ export default function SKTHeaderDashboardScreen() {
           `Tidak ada data yang dikirim. Perbaiki transaksi berikut terlebih dahulu:\n\n${validationErrors.join('\n')}`
         );
       } else if (posted.length === 0 && failed.length === 0) {
-        Alert.alert('Tidak Ada Data', `Tidak ada setoran baru yang bisa dikirim.${waitingNote}`);
+        if (deletedSeats.length > 0 || failedDeletes.length > 0) {
+          Alert.alert(
+            failedDeletes.length > 0 ? 'Post Gagal' : 'Post Berhasil',
+            `Tidak ada setoran baru yang dikirim.${waitingNote}`
+          );
+        } else {
+          Alert.alert('Tidak Ada Data', `Tidak ada setoran baru yang bisa dikirim.${waitingNote}`);
+        }
       } else if (failed.length > 0) {
         Alert.alert(
           'Post Gagal',

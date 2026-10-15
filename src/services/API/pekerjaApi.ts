@@ -1,4 +1,4 @@
-import { buildDetailPekerja, MasterPekerja } from '../pekerja';
+import { buildDetailPekerja, MasterPekerja, ScannedBadge } from '../pekerja';
 import { loadFromCache, CACHE_KEYS } from '../Offline/persistence';
 import { dedupeById } from '../../utils/dedupe';
 import { SKT_API_URL } from '../../config/api';
@@ -132,5 +132,27 @@ export async function loadMasterPekerja(brakId?: number): Promise<MasterPekerja[
 export async function findMasterPekerjaByNik(nik: string): Promise<MasterPekerja | null> {
   const cached = (await loadFromCache<MasterPekerja[]>(CACHE_KEYS.MASTER_PEKERJA)) ?? [];
   const match = cached.find((row) => row.nik === nik && row.active && !row.isTraining);
+  return match ?? null;
+}
+
+/**
+ * Looks up a scanned badge (see parseBadgeScan in services/pekerja.ts) in
+ * the cached master list. The ID's Brak id, nomor absen and NIK must ALL
+ * match the same active, non-training row — a NIK that exists but under a
+ * different Brak or absen is not a match. Parts an older badge doesn't
+ * carry (Brak id, absen) are skipped. Same cache-only rule as
+ * findMasterPekerjaByNik above.
+ */
+export async function findMasterPekerjaByBadge(badge: ScannedBadge): Promise<MasterPekerja | null> {
+  const cached = (await loadFromCache<MasterPekerja[]>(CACHE_KEYS.MASTER_PEKERJA)) ?? [];
+  const match = cached.find(
+    (row) =>
+      row.nik === badge.nik &&
+      (badge.brakId === null || row.brakId === badge.brakId) &&
+      (badge.nomorAbsen === null ||
+        row.nomorAbsen.trim().toUpperCase() === badge.nomorAbsen.toUpperCase()) &&
+      row.active &&
+      !row.isTraining
+  );
   return match ?? null;
 }

@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
     Alert,
+    Image,
     KeyboardAvoidingView,
     Platform,
     ScrollView,
@@ -14,8 +15,14 @@ import {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Keychain from 'react-native-keychain';
 import Icon from 'react-native-vector-icons/FontAwesome5'; // Tambahkan icon
+import { RouteProp, useNavigation, useRoute } from '@react-navigation/native';
+import type { StackNavigationProp } from '@react-navigation/stack';
 import { useAuthStore } from '../store/authStore';
 import AuthServices from '../services/authService';
+import type { AuthStackParamList } from './navigation/authNavigation';
+
+// White Nojorono logo, shown on the blue brand header.
+const NOJORONO_LOGO = require('../assets/images/nojorono-logo-white.png');
 
 // Service key khusus untuk menyimpan kredensial login di secure storage
 // (Android Keystore / iOS Keychain), terpisah dari kredensial lain di device.
@@ -23,9 +30,11 @@ const REMEMBER_ME_SERVICE = 'sktnti-remember-me-credentials';
 
 export default function LoginScreen() {
     const { setSession } = useAuthStore();
+    const navigation = useNavigation<StackNavigationProp<AuthStackParamList, 'Login'>>();
+    const route = useRoute<RouteProp<AuthStackParamList, 'Login'>>();
 
     const [loading, setLoading] = useState(false);
-    const [username, setUsername] = useState('');
+    const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
 
     // State baru untuk fitur tambahan
@@ -41,14 +50,14 @@ export default function LoginScreen() {
                 setRememberMe(isRemembered);
 
                 // Hanya load kredensial jika 'Remember Me' sebelumnya dicentang.
-                // Username & password disimpan bersama di secure storage, bukan
+                // Email & password disimpan bersama di secure storage, bukan
                 // AsyncStorage, karena password tidak boleh tersimpan plain text.
                 if (isRemembered) {
                     const credentials = await Keychain.getGenericPassword({
                         service: REMEMBER_ME_SERVICE,
                     });
                     if (credentials) {
-                        setUsername(credentials.username);
+                        setEmail(credentials.username); // Keychain menyimpan email di field 'username'
                         setPassword(credentials.password);
                     }
                 }
@@ -58,6 +67,15 @@ export default function LoginScreen() {
         };
         loadPreferences();
     }, []);
+
+    // Kembali dari halaman ganti kata sandi yang berhasil: isi email,
+    // kosongkan kata sandi lama, dan minta masuk dengan kata sandi baru.
+    useEffect(() => {
+        if (route.params?.passwordChanged) {
+            if (route.params.email) setEmail(route.params.email);
+            setPassword('');
+        }
+    }, [route.params]);
 
     // Dev-only escape hatch for when the backend/API is unreachable (e.g.
     // off the office network/VPN) and you still need to poke around the
@@ -88,28 +106,41 @@ export default function LoginScreen() {
     };
 
     const handleLogin = async () => {
-        if (!username.trim() || !password.trim()) {
-            Alert.alert('Validation Error', 'Please enter both username and password');
+        if (!email.trim() || !password.trim()) {
+            Alert.alert('Validation Error', 'Please enter both email and password');
             return;
         }
 
         try {
             setLoading(true);
             
-            const response = await AuthServices.login(username, password);
-            console.log('Login response:', response);
+            const response = await AuthServices.login(email.trim(), password);
+            // Never log the whole response — it carries the session token.
+            console.log('Login response:', response.message);
 
             // Simpan status Remember Me
             await AsyncStorage.setItem('rememberMe', rememberMe.toString());
 
-            // Simpan atau hapus kredensial (username + password) di secure
+            // Simpan atau hapus kredensial (email + password) di secure
             // storage berdasarkan status Remember Me.
             if (rememberMe) {
-                await Keychain.setGenericPassword(username, password, {
+                await Keychain.setGenericPassword(email.trim(), password, {
                     service: REMEMBER_ME_SERVICE,
                 });
             } else {
                 await Keychain.resetGenericPassword({ service: REMEMBER_ME_SERVICE });
+            }
+
+            // Wajib ganti kata sandi: sesi TIDAK dimulai. Pengguna diarahkan
+            // ke halaman ganti kata sandi dengan token login ini (kredensial
+            // API change_password), lalu harus masuk lagi dengan kata sandi
+            // baru — jadi menutup/membuka ulang aplikasi tidak melewati langkah ini.
+            if (response.data.must_change_password === 1) {
+                navigation.navigate('ForgotPassword', {
+                    token: response.data.token,
+                    email: response.data.email || email.trim(),
+                });
+                return;
             }
 
             // Persist the token together with its expiry so the session can
@@ -119,6 +150,7 @@ export default function LoginScreen() {
                 token: response.data.token,
                 expiry: response.data.expired_date,
                 user: {
+                    email: response.data.email,
                     username: response.data.username,
                     role: response.data.role,
                     nama_brak: response.data.nama_brak,
@@ -127,13 +159,14 @@ export default function LoginScreen() {
                     // harmless, since role ADMIN skips the MK filter.
                     mk_id: response.data.mk_id,
                     must_change_password: response.data.must_change_password,
+                    sudah_change_password: response.data.sudah_change_password,
                 },
             });
 
             
         } catch (error: any) {
             Alert.alert('Login Failed', error.message || 'An error occurred during login');
-            // warn, not error — a rejected login (bad/inactive username,
+            // warn, not error — a rejected login (bad/inactive email,
             // wrong password) is expected user input, already surfaced via
             // the Alert above; console.error here would pop RN's LogBox
             // redbox for something that isn't an app crash.
@@ -157,9 +190,12 @@ export default function LoginScreen() {
 
                 {/* Brand header, sejalan dengan topBar biru di layar-layar lain */}
                 <View style={styles.brandHeader}>
-                    <View style={styles.brandIconBox}>
-                        <Icon name="smoking" size={30} color="#B45309" solid />
-                    </View>
+                    <Image
+                        source={NOJORONO_LOGO}
+                        style={styles.brandLogo}
+                        resizeMode="contain"
+                        accessibilityLabel="Nojorono"
+                    />
                     <Text style={styles.brandTitle}>Selamat Datang</Text>
                     <Text style={styles.brandSubtitle}>Silakan masuk ke akun SKT NTI Anda</Text>
                 </View>
@@ -167,21 +203,25 @@ export default function LoginScreen() {
                 {/* Kartu form, menimpa header seperti bottom-sheet di layar lain
                     (DetailMejaModal, dsb) — full-bleed, rounded hanya di atas */}
                 <View style={styles.cardContainer}>
-                    {/* Username Input */}
+                    {/* Email Input */}
                     <View style={styles.inputWrapper}>
-                        <Text style={styles.inputLabel}>Username</Text>
+                        <Text style={styles.inputLabel}>Email</Text>
                         <View style={styles.inputRow}>
                             <View style={styles.inputIconBadge}>
-                                <Icon name="id-card" size={16} color="#2F5FD1" solid />
+                                <Icon name="envelope" size={16} color="#2F5FD1" solid />
                             </View>
                             <TextInput
                                 style={styles.input}
-                                placeholder="Masukkan Username"
+                                placeholder="nama@email.com"
                                 placeholderTextColor="#98A2B3"
-                                value={username}
-                                onChangeText={setUsername}
+                                value={email}
+                                onChangeText={setEmail}
                                 editable={!loading}
                                 autoCapitalize="none"
+                                autoCorrect={false}
+                                keyboardType="email-address"
+                                textContentType="emailAddress"
+                                autoComplete="email"
                             />
                         </View>
                     </View>
@@ -217,22 +257,24 @@ export default function LoginScreen() {
                         </View>
                     </View>
 
-                    {/* Remember Me — saat dicentang, username & password disimpan
+                    {/* Remember Me — saat dicentang, email & password disimpan
                         di secure storage (Keychain) supaya auto-terisi lagi
                         di percobaan login berikutnya. */}
-                    <TouchableOpacity
-                        style={styles.rememberMeContainer}
-                        onPress={() => setRememberMe(!rememberMe)}
-                        activeOpacity={0.8}
-                    >
-                        <Icon
-                            name={rememberMe ? 'check-square' : 'square'}
-                            size={18}
-                            color={rememberMe ? '#2F5FD1' : '#98A2B3'}
-                            solid={rememberMe}
-                        />
-                        <Text style={styles.rememberMeText}>Ingat Saya</Text>
-                    </TouchableOpacity>
+                    <View style={styles.optionsRow}>
+                        <TouchableOpacity
+                            style={styles.rememberMeContainer}
+                            onPress={() => setRememberMe(!rememberMe)}
+                            activeOpacity={0.8}
+                        >
+                            <Icon
+                                name={rememberMe ? 'check-square' : 'square'}
+                                size={18}
+                                color={rememberMe ? '#2F5FD1' : '#98A2B3'}
+                                solid={rememberMe}
+                            />
+                            <Text style={styles.rememberMeText}>Ingat Saya</Text>
+                        </TouchableOpacity>
+                    </View>
 
                     <TouchableOpacity
                         style={[styles.button, loading && styles.buttonDisabled]}
@@ -282,21 +324,10 @@ const styles = StyleSheet.create({
         paddingBottom: 56,
         paddingHorizontal: 24,
     },
-    // Kotak ikon putih sedikit dimiringkan, menyerupai kartu rokok pada mockup
-    brandIconBox: {
-        width: 68,
-        height: 68,
-        borderRadius: 18,
-        backgroundColor: '#FFFFFF',
-        justifyContent: 'center',
-        alignItems: 'center',
+    brandLogo: {
+        width: 168,
+        height: 74,
         marginBottom: 16,
-        transform: [{ rotate: '-8deg' }],
-        shadowColor: '#101828',
-        shadowOffset: { width: 0, height: 4 },
-        shadowOpacity: 0.15,
-        shadowRadius: 8,
-        elevation: 4,
     },
     brandTitle: {
         color: '#FFFFFF',
@@ -384,10 +415,15 @@ const styles = StyleSheet.create({
         justifyContent: 'center',
         alignItems: 'center',
     },
+    optionsRow: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        marginBottom: 4,
+    },
     rememberMeContainer: {
         flexDirection: 'row',
         alignItems: 'center',
-        marginBottom: 4,
     },
     rememberMeText: {
         marginLeft: 10,

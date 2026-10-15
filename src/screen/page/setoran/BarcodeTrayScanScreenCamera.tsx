@@ -1,10 +1,9 @@
 // Dedicated camera scanner for Tambah Setoran's "+ Scan to Add" (Barcode
 // Tray) — a separate screen from AbsensiScanScreenCamera (which handles
 // Pekerja Giling/Batil badge scans against skt_master_pekerja). This one
-// scans a tray barcode and verifies it against skt/test_temp
-// (SKT_TEST_TEMP_ENDPOINT) instead — a standalone test table used as a
-// stand-in until a real master tray/batch table exists (see
-// findTestTempRowByCode in sktApi.ts). Kept as its own screen/route rather
+// scans a tray barcode and verifies it against skt_master_barcode instead:
+// the tray must exist, be ACTIVE, and belong to the route's `brakId` (the
+// current user's Brak) — see validateTrayBarcode in sktApi.ts. Kept as its own screen/route rather
 // than another mode on AbsensiScanScreenCamera since it verifies against a
 // completely different data source, not a variant of the pekerja lookup.
 //
@@ -20,10 +19,37 @@ import { useNavigation, useRoute, useIsFocused, RouteProp } from '@react-navigat
 import { useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
 import { CodeScanner, Barcode } from 'react-native-vision-camera-barcode-scanner';
 import type { RootStackParamList } from '../../navigation/mainNavigation';
-import { findTestTempRowByCode, resolveBarcodeTray } from '../../../services/API/sktApi';
-import { TestTempRow } from '../../../services/skt';
+import { validateTrayBarcode, TrayValidation } from '../../../services/API/sktApi';
+import { MasterBarcodeRow } from '../../../services/skt';
 
-type ScanState = 'no-permission' | 'no-device' | 'idle' | 'verifying' | 'success' | 'not-found';
+type ScanState = 'no-permission' | 'no-device' | 'idle' | 'verifying' | 'success' | 'rejected';
+
+type RejectReason = Extract<TrayValidation, { ok: false }>['reason'];
+
+function rejectMessage(
+  reason: RejectReason,
+  code: string | null,
+  tray: MasterBarcodeRow | null,
+  brakId: number | null | undefined
+): { title: string; message: string } {
+  switch (reason) {
+    case 'inactive':
+      return {
+        title: 'Tray Tidak Aktif',
+        message: `Tray ${code} berstatus ${tray?.status ?? 'INACTIVE'} dan tidak bisa dipakai. Hubungi admin.`,
+      };
+    case 'wrong-brak':
+      return {
+        title: 'Tray Beda Brak',
+        message: `Tray ${code} terdaftar untuk Brak ${tray?.brakId}, bukan Brak Anda (${brakId ?? '-'}).`,
+      };
+    default:
+      return {
+        title: 'Barcode Tidak Dikenali',
+        message: `Barcode ${code} tidak ditemukan di master tray. Coba scan ulang, jalankan Get Data, atau hubungi admin.`,
+      };
+  }
+}
 
 type BarcodeTrayScanRouteProp = RouteProp<RootStackParamList, 'BarcodeTrayScan'>;
 
@@ -57,6 +83,7 @@ export default function BarcodeTrayScanScreen() {
   const isFocused = useIsFocused();
   const onScannedCode = route.params?.onScannedCode;
   const onCancelled = route.params?.onCancelled;
+  const brakId = route.params?.brakId;
 
   const { hasPermission, requestPermission } = useCameraPermission();
 
@@ -68,14 +95,8 @@ export default function BarcodeTrayScanScreen() {
 
   const [scanState, setScanState] = useState<ScanState>(hasPermission ? 'idle' : 'no-permission');
   const [scannedCode, setScannedCode] = useState<string | null>(null);
-  const [matchedTestTemp, setMatchedTestTemp] = useState<TestTempRow | null>(null);
-  // Fetched separately from the test_temp match above, and allowed to fail
-  // or still be in flight while `success` is already showing — the batang
-  // count is just a preview here (see resolveBarcodeTray in sktApi.ts,
-  // called again for real once TambahSetoranModal picks up this scan), so
-  // a slow/failed lookup shouldn't block or revert an otherwise-recognized
-  // barcode.
-  const [resolvedBatang, setResolvedBatang] = useState<number | null>(null);
+  const [matchedTray, setMatchedTray] = useState<MasterBarcodeRow | null>(null);
+  const [rejectReason, setRejectReason] = useState<RejectReason>('not-found');
 
   // Bumped on every "Coba Lagi" tap to force CodeScannerErrorBoundary to
   // fully remount and to restart the no-device grace timer below.
@@ -121,38 +142,32 @@ export default function BarcodeTrayScanScreen() {
     return () => clearTimeout(timer);
   }, [hasPermission, device, retryKey]);
 
-  // Verify the scanned code against skt/test_temp — a match on `name_test`
-  // (or `id` as a fallback) counts as "recognized"; anything else is
-  // rejected. See findTestTempRowByCode in sktApi.ts for the matching
-  // rule and why test_temp stands in for a real tray/batch table.
-  const handleScannedCode = useCallback(async (code: string) => {
-    setScannedCode(code);
-    setScanState('verifying');
-    setResolvedBatang(null);
+  // Verify the scanned code against the cached skt_master_barcode rows —
+  // it must exist, be ACTIVE, and belong to `brakId` (see
+  // validateTrayBarcode in sktApi.ts). Anything else is rejected with the
+  // specific reason.
+  const handleScannedCode = useCallback(
+    async (code: string) => {
+      setScannedCode(code);
+      setScanState('verifying');
 
-    try {
-      const match = await findTestTempRowByCode(code);
-      if (!match) {
-        setMatchedTestTemp(null);
-        setScanState('not-found');
-        return;
-      }
-      setMatchedTestTemp(match);
-      setScanState('success');
-
-      // Best-effort quantity preview — a failure here doesn't undo the
-      // "success" state above, it just leaves the quantity line blank.
       try {
-        const tray = await resolveBarcodeTray(code);
-        setResolvedBatang(tray.batang);
+        const result = await validateTrayBarcode(code, brakId);
+        setMatchedTray(result.tray);
+        if (result.ok) {
+          setScanState('success');
+        } else {
+          setRejectReason(result.reason);
+          setScanState('rejected');
+        }
       } catch {
-        setResolvedBatang(null);
+        setMatchedTray(null);
+        setRejectReason('not-found');
+        setScanState('rejected');
       }
-    } catch {
-      setMatchedTestTemp(null);
-      setScanState('not-found');
-    }
-  }, []);
+    },
+    [brakId]
+  );
 
   const handleBarcodeScanned = (barcodes: Barcode[]) => {
     if (isProcessingRef.current) return;
@@ -166,13 +181,12 @@ export default function BarcodeTrayScanScreen() {
   const resetToIdle = () => {
     isProcessingRef.current = false;
     setScannedCode(null);
-    setMatchedTestTemp(null);
-    setResolvedBatang(null);
+    setMatchedTray(null);
     setScanState('idle');
   };
 
   const handleGunakan = () => {
-    if (scannedCode && matchedTestTemp) {
+    if (scannedCode && matchedTray && scanState === 'success') {
       resolvedRef.current = true;
       onScannedCode?.(scannedCode);
     }
@@ -210,7 +224,10 @@ export default function BarcodeTrayScanScreen() {
               isActive={isCameraActive}
               barcodeFormats={['all-formats']}
               onBarcodeScanned={handleBarcodeScanned}
-              onError={() => setScanState('not-found')}
+              onError={() => {
+                setRejectReason('not-found');
+                setScanState('rejected');
+              }}
             />
           </CodeScannerErrorBoundary>
         ) : hasPermission && scanState === 'idle' ? (
@@ -284,17 +301,15 @@ export default function BarcodeTrayScanScreen() {
           </View>
         )}
 
-        {scanState === 'success' && scannedCode && matchedTestTemp && (
+        {scanState === 'success' && scannedCode && matchedTray && (
           <View>
             <View style={styles.successIconCircle}>
               <Text style={styles.successIconText}>✓</Text>
             </View>
             <Text style={styles.successTitle}>Barcode Ditemukan</Text>
-            <Text style={styles.workerName}>{scannedCode}</Text>
-            <Text style={styles.workerMeta}>{matchedTestTemp.nameTest}</Text>
-            <Text style={styles.workerQuantity}>
-              {resolvedBatang != null ? `${resolvedBatang} Batang` : 'Memuat jumlah...'}
-            </Text>
+            <Text style={styles.workerName}>{matchedTray.code}</Text>
+            <Text style={styles.workerMeta}>Brak {matchedTray.brakId}</Text>
+            <Text style={styles.workerQuantity}>{matchedTray.jumlahBatang} Batang</Text>
             <TouchableOpacity
               style={[styles.primaryButton, styles.fullWidthButton]}
               onPress={handleGunakan}
@@ -305,14 +320,16 @@ export default function BarcodeTrayScanScreen() {
           </View>
         )}
 
-        {scanState === 'not-found' && (
+        {scanState === 'rejected' && (
           <View>
             <View style={styles.errorIconCircle}>
               <Text style={styles.errorIconText}>✕</Text>
             </View>
-            <Text style={styles.errorTitle}>Barcode Tidak Dikenali</Text>
+            <Text style={styles.errorTitle}>
+              {rejectMessage(rejectReason, scannedCode, matchedTray, brakId).title}
+            </Text>
             <Text style={styles.errorSubtitle}>
-              Barcode {scannedCode} tidak ditemukan di data. Coba scan ulang atau hubungi admin.
+              {rejectMessage(rejectReason, scannedCode, matchedTray, brakId).message}
             </Text>
             <TouchableOpacity style={styles.primaryButton} onPress={resetToIdle} activeOpacity={0.85}>
               <Text style={styles.primaryButtonText}>Coba Lagi</Text>

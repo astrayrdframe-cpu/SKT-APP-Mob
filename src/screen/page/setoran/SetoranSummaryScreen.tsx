@@ -13,10 +13,14 @@ import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { RootStackParamList } from '../../navigation/mainNavigation';
 import { buildSetoranSummary } from '../../../services/API/sktApi';
 import { SetoranSummary, MejaSummary, PekerjaPair, SKTDetail, SetoranWorker } from '../../../services/skt';
-import { loadFromCache, sktDetailCacheKey } from '../../../services/Offline/persistence';
+import {
+  loadFromCache,
+  sktDetailCacheKey,
+  knownMejaCacheKey,
+} from '../../../services/Offline/persistence';
 import { useOffline } from '../../../context/OfflineContext';
 import { useAuthStore } from '../../../store/authStore';
-import { getVisibleMejaNumbers } from '../../../utils/accessControl';
+import { getVisibleMejaNumbers, withKnownMeja } from '../../../utils/accessControl';
 
 type SummaryRouteProp = RouteProp<RootStackParamList, 'SetoranSummary'>;
 type NavProp = NativeStackNavigationProp<RootStackParamList, 'SetoranSummary'>;
@@ -137,6 +141,7 @@ export default function SetoranSummaryScreen() {
   // shared by several logins on one device is never pre-filtered for
   // whoever happened to load it first. `summary` below is the filtered view.
   const [fullSummary, setSummary] = useState<SetoranSummary | null>(null);
+  const [knownMeja, setKnownMeja] = useState<number[] | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
@@ -155,13 +160,16 @@ export default function SetoranSummaryScreen() {
       );
       if (cached) {
         setSummary(buildSetoranSummary(id, cached.workers, cached.detail));
+        setKnownMeja(
+          await loadFromCache<number[]>(knownMejaCacheKey(id, user?.username ?? ''))
+        );
       } else {
         setError('Data belum tersedia. Jalankan Get Data terlebih dahulu.');
       }
     } finally {
       setIsLoading(false);
     }
-  }, [id]);
+  }, [id, user?.username]);
 
   // Reload from the cache every time this screen comes into focus (first
   // open, and returning to it), so it always reflects the transactions
@@ -177,11 +185,14 @@ export default function SetoranSummaryScreen() {
   // sees its own meja here too, with the totals recomputed from just those.
   const summary = useMemo((): SetoranSummary | null => {
     if (!fullSummary) return null;
-    const visible = getVisibleMejaNumbers(
-      user,
-      fullSummary.mejaSummaries.flatMap((m) =>
-        (m.mkIds ?? []).map((mkId) => ({ nomorMeja: m.nomorMeja, mkId }))
-      )
+    const visible = withKnownMeja(
+      getVisibleMejaNumbers(
+        user,
+        fullSummary.mejaSummaries.flatMap((m) =>
+          (m.mkIds ?? []).map((mkId) => ({ nomorMeja: m.nomorMeja, mkId }))
+        )
+      ),
+      knownMeja
     );
     if (!visible) return fullSummary;
     const mejaSummaries = fullSummary.mejaSummaries.filter((m) => visible.has(m.nomorMeja));
@@ -191,7 +202,7 @@ export default function SetoranSummaryScreen() {
       totalSetoran: mejaSummaries.reduce((sum, m) => sum + m.totalGood, 0),
       totalUpah: mejaSummaries.reduce((sum, m) => sum + (m.totalUpah ?? 0), 0),
     };
-  }, [fullSummary, user]);
+  }, [fullSummary, user, knownMeja]);
 
   // Expand the first visible meja by default, like the mockup — once, on
   // the first summary that has any, so a later reload doesn't override

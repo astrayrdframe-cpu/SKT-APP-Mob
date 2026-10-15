@@ -38,13 +38,23 @@ export const CACHE_KEYS = {
   NAV_STATE: 'nav-state',
   FILTER_DATA: 'skt-filter-data',
   SKT_LIST: 'skt-header-list-v2', // bumped: v1 shape is incompatible with current SKTHeaderItem
-  TEST_TEMP: 'skt-test-temp', // skt/test_temp rows, refreshed on Dashboard "Get Data"
+  MASTER_BARCODE: 'skt-master-barcode', // skt_master_barcode tray rows, refreshed on Dashboard "Get Data"
   // skt_master_pekerja rows (active, non-training only — see
   // fetchMasterPekerja's default filters), refreshed on Dashboard "Get
-  // Data" alongside TEST_TEMP above. AbsensiScanScreenCamera's badge-scan
+  // Data" alongside MASTER_BARCODE above. AbsensiScanScreenCamera's badge-scan
   // lookup (findMasterPekerjaByNik in pekerjaApi.ts) reads this instead of
   // hitting ORDS live on every single scan.
   MASTER_PEKERJA: 'skt-master-pekerja',
+  // { [username]: ISO time of that login's last successful "Get Data" } —
+  // tells the Dashboard whether the current login already has cached data
+  // on this device. A login with none gets a today-only pull (see
+  // syncAllFromOrds in SKTHeaderDashboardScreen).
+  SYNCED_USERS: 'skt-synced-users',
+  // Server seats (skt_log_pekerja) deleted on the device and not yet sent —
+  // see queueSeatDelete in services/API/setoranPost.ts. Kept apart from the
+  // per-header detail cache so "Get Data" replacing that cache can't bring
+  // a deleted seat back or lose the pending delete.
+  PENDING_SEAT_DELETES: 'skt-pending-seat-deletes',
 } as const;
 
 // Each SKT detail record is cached individually, keyed by its id, so a
@@ -54,13 +64,19 @@ export const CACHE_KEYS = {
 // earlier builds.
 export const sktDetailCacheKey = (id: string | number) => `skt-detail-v2-${id}`;
 
+// Every meja one login has seen on one header — kept so a meja stays
+// listed (empty) after its last pekerja is deleted, instead of vanishing
+// with its rows. Separate from the detail cache, which "Get Data" replaces.
+export const knownMejaCacheKey = (headerId: string | number, username: string) =>
+  `skt-known-meja-v1-${headerId}-${username}`;
+
 export const setoranSummaryCacheKey = (id: string | number) => `setoran-summary-${id}`;
 
 // Normalizes the whole local cache in place — run on Dashboard load and
 // after every "Get Data". Drops:
 //   - duplicate skt_master_pekerja rows (same id, or same NIK — NIK is
 //     unique per person; nomor_absen is NOT, it repeats across Braks),
-//   - duplicate SKT header / test_temp rows (same id),
+//   - duplicate SKT header / master barcode rows (same id),
 //   - duplicate worker rows inside each cached header detail (same id),
 //   - skt-detail-v2-* entries for a header that's no longer in the cached
 //     header list (removed server-side), and every legacy
@@ -86,8 +102,9 @@ export async function cleanupCache(): Promise<void> {
       );
     }
 
-    const testTemp = await loadFromCache<{ id: number }[]>(CACHE_KEYS.TEST_TEMP);
-    if (testTemp) await writeIfChanged(CACHE_KEYS.TEST_TEMP, testTemp, dedupeById(testTemp, (r) => r.id));
+    const barcodes = await loadFromCache<{ id: number }[]>(CACHE_KEYS.MASTER_BARCODE);
+    if (barcodes) await writeIfChanged(CACHE_KEYS.MASTER_BARCODE, barcodes, dedupeById(barcodes, (r) => r.id));
+    await removeFromCache('skt-test-temp'); // legacy skt/test_temp cache, no longer used
 
     const headers = await loadFromCache<{ id: number }[]>(CACHE_KEYS.SKT_LIST);
     if (!headers) return; // never synced — nothing to compare orphans against
